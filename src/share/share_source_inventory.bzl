@@ -528,6 +528,15 @@ SHARE_UNITY_GROUPS = [
         generated_srcs = [],
         external_srcs = [],
     ),
+    struct(
+        name = "ob_share_FILE_SQL_0",
+        language = "c++",
+        srcs = [
+            "src/share/file_sql/ob_file_sql_utils.cpp",
+        ],
+        generated_srcs = [],
+        external_srcs = [],
+    ),
 ]
 
 SHARE_STANDALONE_SOURCES = [

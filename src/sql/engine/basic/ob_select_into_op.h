@@ -18,6 +18,7 @@
 #define SRC_SQL_ENGINE_BASIC_OB_SELECT_INTO_OP_H_
 
 #include "sql/engine/ob_operator.h"
+#include "share/file_sql/ob_file_sql_utils.h"
 #include "lib/file/ob_file.h"
 #include "sql/engine/cmd/ob_load_data_parser.h"
 #include "sql/engine/basic/ob_select_into_basic.h"
@@ -126,7 +127,8 @@ public:
       external_properties_(),
       format_type_(ObExternalFileFormat::FormatType::CSV_FORMAT),
       block_id_(0),
-      need_commit_(true)
+      need_commit_(true),
+      file_copy_(false), file_copy_finished_(false)
   {
   }
 
@@ -195,6 +197,7 @@ public:
   virtual void destroy() override;
 
 private:
+  int copy_file_rows(bool batch);
   int init_env_common();
   int init_csv_env();
   void set_csv_format_options();
@@ -292,6 +295,9 @@ private:
   ObExternalFileFormat::FormatType format_type_;
   uint32_t block_id_;
   bool need_commit_;
+  share::file_sql::ObFileSqlCsvWriter file_copy_writer_;
+  bool file_copy_;
+  bool file_copy_finished_;
   static const int64_t SHARED_BUFFER_SIZE = 2LL * 1024 * 1024;
 
 };

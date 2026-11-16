@@ -19,6 +19,8 @@
 #include "sql/engine/basic/ob_function_table_op.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
+#include "sql/resolver/ob_resolver_utils.h"
+#include "share/object/ob_obj_cast.h"
 
 
 namespace oceanbase
@@ -27,7 +29,7 @@ using namespace common;
 namespace sql
 {
 
-OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_);
+OB_SERIALIZE_MEMBER((ObFunctionTableSpec, ObOpSpec), value_expr_, column_exprs_, has_correlated_expr_, file_column_ids_);
 
 int ObFunctionTableOp::inner_open()
 {
@@ -36,6 +38,9 @@ int ObFunctionTableOp::inner_open()
   already_calc_ = false;
   if (OB_ISNULL(MY_SPEC.value_expr_)) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (ObVarcharType == MY_SPEC.value_expr_->datum_meta_.type_) {
+    next_row_func_ = &ObFunctionTableOp::inner_get_next_row_file;
+    OZ (open_file_table());
   } else if (ObExtendType == MY_SPEC.value_expr_->datum_meta_.type_) {
     next_row_func_ = &ObFunctionTableOp::inner_get_next_row_udf;
   } else {
@@ -50,6 +55,11 @@ int ObFunctionTableOp::inner_rescan()
   if (OB_FAIL(ObOperator::inner_rescan())) {
   } else {
     node_idx_ = 0;
+    if (ObVarcharType == MY_SPEC.value_expr_->datum_meta_.type_) {
+      file_reader_.close(); file_rows_.reset(); file_names_.reset();
+      file_batch_allocator_.reuse(); file_allocator_.reuse();
+      OZ (open_file_table());
+    }
     if (MY_SPEC.has_correlated_expr_) {
       row_count_ = 0;
       col_count_ = 0;
@@ -67,11 +77,19 @@ int ObFunctionTableOp::inner_close()
   row_count_ = 0;
   col_count_ = 0;
   value_table_ = NULL;
+  file_reader_.close();
+  file_rows_.reset(); file_names_.reset();
+  file_batch_allocator_.reuse(); file_allocator_.reuse();
   return ret;
 }
 
 void ObFunctionTableOp::destroy()
 {
+  file_reader_.~ObFileSqlReader();
+  file_rows_.~ObArray();
+  file_names_.~ObArray();
+  file_batch_allocator_.~ObArenaAllocator();
+  file_allocator_.~ObArenaAllocator();
   ObOperator::destroy();
 }
 
@@ -191,6 +209,91 @@ int ObFunctionTableOp::inner_get_next_row_udf()
         if (OB_SUCC(ret)) {
           MY_SPEC.column_exprs_.at(i)->set_evaluated_projected(eval_ctx_);
         }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObFunctionTableOp::open_file_table()
+{
+  using namespace share::file_sql;
+  int ret = OB_SUCCESS;
+  ObDatum *config = nullptr;
+  ObObj enabled, secure;
+  ObString expected_version;
+  OZ (ctx_.get_my_session()->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled));
+  if (OB_SUCC(ret) && enabled.get_int() == 0) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "file SQL is disabled");
+  }
+  OZ (ctx_.get_my_session()->get_sys_variable(share::SYS_VAR_SECURE_FILE_PRIV, secure));
+  OZ (MY_SPEC.value_expr_->eval(eval_ctx_, config));
+  OZ (file_sql_parse_config(file_allocator_, config->get_string(), file_path_, file_format_, file_options_, expected_version));
+  file_pos_ = 0;
+  file_eof_ = false;
+  if (OB_SUCC(ret) && file_format_ == FILE_SQL_FORMAT_GLOB) {
+    OZ (file_sql_glob(file_allocator_, file_path_, file_names_));
+    for (int64_t i = 0; OB_SUCC(ret) && i < file_names_.count(); ++i) {
+      ObString canonical;
+      OZ (file_sql_check_path(file_names_.at(i), false, file_allocator_, canonical));
+      OZ (ObResolverUtils::check_secure_path(secure.get_string(), canonical));
+    }
+  } else if (OB_SUCC(ret)) {
+    ObString canonical;
+    OZ (file_sql_check_path(file_path_, false, file_allocator_, canonical));
+    OZ (ObResolverUtils::check_secure_path(secure.get_string(), canonical));
+    OZ (file_reader_.open(file_allocator_, canonical, file_format_, file_options_,
+                                expected_version, &MY_SPEC.file_column_ids_));
+    for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.file_column_ids_.count(); ++i) {
+      if (MY_SPEC.file_column_ids_.at(i) >= file_reader_.get_columns().count()) { ret = OB_SCHEMA_ERROR; }
+    }
+  }
+  return ret;
+}
+
+int ObFunctionTableOp::inner_get_next_row_file()
+{
+  using namespace share::file_sql;
+  int ret = OB_SUCCESS;
+  clear_evaluated_flag();
+  OZ (ctx_.check_status());
+  if (OB_SUCC(ret) && file_format_ == FILE_SQL_FORMAT_GLOB) {
+    if (file_pos_ >= file_names_.count()) { ret = OB_ITER_END; }
+    else {
+      for (int64_t i = 0; i < MY_SPEC.column_exprs_.count(); ++i) {
+        ObExpr *expr = MY_SPEC.column_exprs_.at(i);
+        expr->locate_datum_for_write(eval_ctx_).set_string(file_names_.at(file_pos_));
+        expr->set_evaluated_projected(eval_ctx_);
+      }
+      ++file_pos_;
+    }
+  } else if (OB_SUCC(ret)) {
+    if (file_pos_ >= file_rows_.count() && !file_eof_) {
+      file_rows_.reset(); file_batch_allocator_.reuse(); file_pos_ = 0;
+      OZ (file_reader_.next_batch(file_batch_allocator_, 1024, file_rows_, file_eof_));
+    }
+    if (OB_SUCC(ret) && file_pos_ >= file_rows_.count()) { ret = OB_ITER_END; }
+    if (OB_SUCC(ret)) {
+      const auto &row = file_rows_.at(file_pos_++);
+      const ObDataTypeCastParams dtc = ObBasicSessionInfo::create_dtc_params(ctx_.get_my_session());
+      for (int64_t i = 0; OB_SUCC(ret) && i < MY_SPEC.column_exprs_.count(); ++i) {
+        const int64_t index = MY_SPEC.file_column_ids_.at(i);
+        ObExpr *expr = MY_SPEC.column_exprs_.at(i);
+        ObDatum &datum = expr->locate_datum_for_write(eval_ctx_);
+        if (index >= row.count()) { ret = OB_SCHEMA_ERROR; }
+        else if (row.at(index).is_null_) { datum.set_null(); }
+        else {
+          const auto &cell = row.at(index);
+          ObObj input, result;
+          if (file_reader_.get_columns().at(index).type_ == FILE_SQL_COL_BOOLEAN) {
+            input.set_tinyint(cell.value_.case_compare("true") == 0 || cell.value_ == "1");
+          } else { input.set_varchar(cell.value_); input.set_collation_type(CS_TYPE_UTF8MB4_BIN); }
+          ObCastCtx cast_ctx(&file_batch_allocator_, &dtc, CM_NONE, expr->obj_meta_.get_collation_type());
+          OZ (ObObjCaster::to_type(expr->obj_meta_.get_type(), expr->obj_meta_.get_collation_type(), cast_ctx, input, result));
+          OZ (datum.from_obj(result, expr->obj_datum_map_));
+        }
+        if (OB_SUCC(ret)) { expr->set_evaluated_projected(eval_ctx_); }
       }
     }
   }

@@ -497,6 +497,8 @@ END_P SET_VAR DELIMITER
 %type <node> dynamic_sampling_hint
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
+%type <node> file_sql_table file_sql_alias file_sql_copy file_sql_copy_options file_sql_copy_option file_sql_copy_value
+%type <node> file_sql_copy_source file_sql_copy_options_opt
 %type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
@@ -581,6 +583,7 @@ stmt:
   | delete_stmt             { $$ = $1; question_mark_issue($$, result); }
   | drop_table_stmt         { $$ = $1; check_question_mark($$, result); }
   | drop_view_stmt          { $$ = $1; check_question_mark($$, result); }
+  | file_sql_copy           { $$ = $1; question_mark_issue($$, result); }
   | explain_stmt            { $$ = $1; question_mark_issue($$, result); }
   | create_outline_stmt     { $$ = $1; question_mark_issue($$, result); }
   | alter_outline_stmt      { $$ = $1; question_mark_issue($$, result); }
@@ -10831,6 +10834,10 @@ tbl_name
   unname_node->sql_str_off_ = @2.first_column;
   $$->value_ = 1; //lateral
 }
+| file_sql_table
+{
+  $$ = $1;
+}
 | json_table_expr
 {
   $$ = $1;
@@ -10848,6 +10855,83 @@ tbl_name
 {
   $$ = $1;
 }
+;
+
+
+// File table functions use the existing FUNCTION_TABLE execution path.
+file_sql_table:
+NAME_OB '(' expr_list ')' file_sql_alias
+{
+  $3->is_tree_not_param_ = true;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $5);
+}
+;
+
+file_sql_alias:
+/* empty */ %prec ')' { $$ = NULL; }
+| relation_name { $$ = $1; }
+| AS relation_name { $$ = $2; }
+;
+
+file_sql_copy:
+COPY file_sql_copy_source TO STRING_VALUE file_sql_copy_options_opt
+{
+  ParseNode *into = NULL;
+  malloc_non_terminal_node(into, result->malloc_pool_, T_INTO_OUTFILE, 2, $4, $5);
+  into->is_tree_not_param_ = true;
+  if (NULL != $2->children_[PARSE_SELECT_INTO] || NULL != $2->children_[PARSE_SELECT_INTO_EXTRA]) {
+    yyerror(&@1, result, "COPY query cannot contain INTO");
+    YYABORT;
+  }
+  $2->children_[PARSE_SELECT_INTO_EXTRA] = into;
+  $$ = $2;
+}
+;
+
+file_sql_copy_source:
+'(' select_stmt ')' { $$ = $2; }
+| relation_factor
+{
+  ParseNode *star = NULL;
+  ParseNode *project = NULL;
+  ParseNode *projects = NULL;
+  ParseNode *table = NULL;
+  ParseNode *tables = NULL;
+  malloc_terminal_node(star, result->malloc_pool_, T_STAR);
+  dup_string_to_node(star, result->malloc_pool_, "*");
+  malloc_non_terminal_node(project, result->malloc_pool_, T_PROJECT_STRING, 1, star);
+  merge_nodes(projects, result, T_PROJECT_LIST, project);
+  malloc_non_terminal_node(table, result->malloc_pool_, T_ORG, 4, $1, NULL, NULL, NULL);
+  merge_nodes(tables, result, T_FROM_LIST, table);
+  malloc_select_node($$, result->malloc_pool_);
+  $$->children_[PARSE_SELECT_SELECT] = projects;
+  $$->children_[PARSE_SELECT_FROM] = tables;
+}
+;
+
+file_sql_copy_options_opt:
+/* empty */ { $$ = NULL; }
+| '(' file_sql_copy_options ')' { merge_nodes($$, result, T_EXPR_LIST, $2); }
+;
+
+file_sql_copy_options:
+file_sql_copy_option { $$ = $1; }
+| file_sql_copy_options ',' file_sql_copy_option
+{ malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3); }
+;
+
+file_sql_copy_option:
+relation_name
+{ malloc_non_terminal_node($$, result->malloc_pool_, T_OP_EQ, 2, $1, NULL); }
+| relation_name file_sql_copy_value
+{ malloc_non_terminal_node($$, result->malloc_pool_, T_OP_EQ, 2, $1, $2); }
+| relation_name COMP_EQ file_sql_copy_value
+{ malloc_non_terminal_node($$, result->malloc_pool_, T_OP_EQ, 2, $1, $3); }
+;
+
+file_sql_copy_value:
+literal { $$ = $1; }
+| relation_name { $$ = $1; $$->type_ = T_VARCHAR; }
 ;
 
 tbl_name:
@@ -12265,7 +12349,7 @@ explain_or_desc relation_factor opt_desc_column_option
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $2, NULL, $3);
 }
 
-| explain_or_desc explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);}
+| explain_or_desc explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL); $$->children_[0] = $1; }
 | explain_or_desc PRETTY explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY, $3, NULL, NULL);}
 | explain_or_desc PRETTY_COLOR explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY_COLOR, $3, NULL, NULL);}
 
@@ -12306,8 +12390,8 @@ explain_or_desc relation_factor opt_desc_column_option
 
 explain_or_desc:
 EXPLAIN {$$ = NULL;}
-| DESCRIBE {$$ = NULL;}
-| DESC  {$$ = NULL;}
+| DESCRIBE { malloc_terminal_node($$, result->malloc_pool_, T_INT); $$->is_hidden_const_ = 1; }
+| DESC { malloc_terminal_node($$, result->malloc_pool_, T_INT); $$->is_hidden_const_ = 1; }
 ;
 
 explainable_stmt:

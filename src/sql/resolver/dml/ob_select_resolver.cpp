@@ -28,6 +28,7 @@
 #include "sql/engine/expr/ob_expr_regexp_context.h"
 #include "sql/engine/expr/ob_json_param_type.h"
 #include "sql/parser/ob_parser_utils.h"
+#include "share/file_sql/ob_file_sql_utils.h"
 
 #include "sql/executor/ob_memory_tracker.h"
 namespace oceanbase
@@ -3105,7 +3106,25 @@ int ObSelectResolver::resolve_into_clause(const ParseNode *node)
       new(into_item) ObSelectIntoItem();
       into_item->into_type_ = node->type_;
       if (T_INTO_OUTFILE == node->type_) { // into outfile
-        if (is_in_set_query()) {
+        if (node->num_child_ == 2) { // COPY is a SELECT INTO with CSV options.
+          using namespace share::file_sql;
+          ObString path, options;
+          OZ (check_file_sql_enabled());
+          OZ (resolve_into_const_node(node->children_[0], into_item->outfile_name_));
+          OZ (resolve_file_sql_path(into_item->outfile_name_.get_string(), true, path));
+          OZ (resolve_file_sql_options(node->children_[1], 0, FILE_SQL_FORMAT_CSV, true, options));
+          if (OB_SUCC(ret)) {
+            ObSqlString properties;
+            OZ (properties.append("FILE_SQL_COPY:"));
+            OZ (properties.append(options));
+            OZ (ob_write_string(*allocator_, properties.string(), into_item->external_properties_));
+            into_item->outfile_name_.set_varchar(path);
+            for (int64_t i = 0; OB_SUCC(ret) && i < select_stmt->get_select_item_size(); ++i) {
+              const SelectItem &select_item = select_stmt->get_select_item(i);
+              OZ (into_item->user_vars_.push_back(select_item.alias_name_.empty() ? select_item.expr_name_ : select_item.alias_name_));
+            }
+          }
+        } else if (is_in_set_query()) {
           ret = OB_INAPPROPRIATE_INTO;
         } else if (node->num_child_ == 3 && NULL != node->children_[1]
             && T_EXTERNAL_FILE_FORMAT == node->children_[1]->type_) { // Handle with `FORMAT`

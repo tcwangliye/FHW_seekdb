@@ -13,6 +13,14 @@
     },
     "deps": ["local"]
   },
+  "file_sql": {
+    "crate": "file_sql",
+    "headers": {
+      "file_sql_bridge.h": "cxxbridge/include/file_sql/src/bridge.rs.h",
+      "rust/cxx.h": "cxxbridge/include/rust/cxx.h"
+    },
+    "deps": []
+  },
   "local": {
     "crate": "local",
     "headers": {

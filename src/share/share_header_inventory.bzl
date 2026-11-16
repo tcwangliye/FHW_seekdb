@@ -2,6 +2,7 @@
 
 SHARE_PUBLIC_HEADER_ROOTS = [
     "aggregate/ob_pushdown_aggregate_protocol.h",
+    "file_sql/ob_file_sql_utils.h",
     "ai_service/ob_ai_service_struct.h",
     "allocator/ob_reserve_arena.h",
     "autoincrement/ob_i_tablet_autoincrement_admin.h",

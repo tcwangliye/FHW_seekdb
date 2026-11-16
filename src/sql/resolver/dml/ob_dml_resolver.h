@@ -386,6 +386,11 @@ protected:
   int check_contain_lateral_node(const ParseNode *parse_tree, bool &is_contain);
 
   int check_stmt_has_snapshot_query(ObDMLStmt *stmt, bool check_all, bool &has_fq);
+  int check_file_sql_enabled();
+  int resolve_file_sql_path(const ObString &path, bool for_write, ObString &resolved);
+  int resolve_file_sql_options(const ParseNode *args, int64_t start,
+                               uint32_t format, bool for_write, ObString &options);
+  int resolve_file_table_item(const ParseNode &node, TableItem *&table_item);
   virtual int resolve_basic_table(const ParseNode &parse_tree, TableItem *&table_item);
   int resolve_snapshot_query_node(const ParseNode *time_node, TableItem *table_item);
   int check_snapshot_expr_validity(ObRawExpr *expr, bool &has_column);

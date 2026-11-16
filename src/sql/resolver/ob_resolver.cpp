@@ -16,6 +16,8 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ob_resolver.h"
+#include "sql/parser/ob_parser.h"
+#include "lib/string/ob_sql_string.h"
 #include "lib/utility/ob_smart_call.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "sql/resolver/cmd/ob_alter_system_resolver.h"
@@ -105,6 +107,19 @@ ObResolver::ObResolver(ObResolverParams &params)
     : params_(params)
 {
 
+}
+
+namespace
+{
+bool file_sql_contains_source(const ParseNode *node)
+{
+  if (nullptr == node) { return false; }
+  if (T_FILE_TABLE_EXPRESSION == node->type_) { return true; }
+  for (int64_t i = 0; i < node->num_child_; ++i) {
+    if (file_sql_contains_source(node->children_[i])) { return true; }
+  }
+  return false;
+}
 }
 
 ObResolver::~ObResolver()
@@ -473,7 +488,66 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
         break;
       }
       case T_EXPLAIN: {
-        REGISTER_STMT_RESOLVER(Explain);
+        if (parse_tree.num_child_ == 5 && parse_tree.children_[0] != nullptr
+            && parse_tree.children_[0]->type_ == T_INT
+            && parse_tree.children_[4] != nullptr && parse_tree.children_[4]->type_ == T_SELECT
+            && file_sql_contains_source(parse_tree.children_[4])) {
+          ObStmt *described_stmt = nullptr;
+          OZ (select_stmt_resolver_func<ObSelectResolver>(params_, *parse_tree.children_[4], described_stmt));
+          ObSqlString query;
+          auto append_literal = [&query](const ObString &value) -> int {
+            int ret = OB_SUCCESS;
+            OZ (query.append("CONVERT(X'"));
+            for (int64_t i = 0; OB_SUCC(ret) && i < value.length(); ++i) {
+              OZ (query.append_fmt("%02X", static_cast<unsigned char>(value.ptr()[i])));
+            }
+            OZ (query.append("' USING utf8mb4)"));
+            return ret;
+          };
+          if (OB_SUCC(ret)) {
+            const auto *select = static_cast<const ObSelectStmt *>(described_stmt);
+            for (int64_t i = 0; OB_SUCC(ret) && i < select->get_select_item_size(); ++i) {
+              const auto &item = select->get_select_item(i);
+              const auto &type = item.expr_->get_result_type();
+              const char *name = nullptr;
+              switch (type.get_type()) {
+                case ObTinyIntType: name = "BOOLEAN"; break;
+                case ObIntType: name = "BIGINT"; break;
+                case ObDoubleType: name = "DOUBLE"; break;
+                case ObDateType: name = "DATE"; break;
+                case ObDateTimeType: name = "DATETIME"; break;
+                case ObNullType: name = "NULL"; break;
+                case ObVarcharType: name = "VARCHAR"; break;
+                default: name = ob_obj_type_str(type.get_type()); break;
+              }
+              OZ (query.append(i == 0 ? "SELECT " : " UNION ALL SELECT "));
+              OZ (append_literal(item.alias_name_.empty() ? item.expr_name_ : item.alias_name_));
+              OZ (query.append(" AS column_name, "));
+              OZ (append_literal(ObString(name)));
+              OZ (query.append_fmt(" AS column_type, '%s' AS `null`, NULL AS `key`, NULL AS `default`, NULL AS extra",
+                                    (type.get_result_flag() & NOT_NULL_FLAG) != 0 ? "NO" : "YES"));
+            }
+          }
+          if (OB_SUCC(ret)) {
+            ParseResult result;
+            ObParser parser(*params_.allocator_, params_.session_info_->get_sql_mode(), params_.session_info_->get_charsets4parser());
+            OZ (parser.parse(query.string(), result));
+            if (OB_SUCC(ret)) {
+              CK (result.result_tree_ != nullptr && result.result_tree_->num_child_ > 0);
+              if (OB_SUCC(ret)) {
+                ObResolver resolver(params_);
+                OZ (resolver.resolve(if_prepared, *result.result_tree_->children_[0], stmt));
+              }
+            }
+          }
+        } else {
+          ParseNode explain_tree = parse_tree;
+          ParseNode *children[5];
+          for (int64_t i = 0; i < 5; ++i) { children[i] = parse_tree.children_[i]; }
+          if (children[0] != nullptr && children[0]->type_ == T_INT) { children[0] = nullptr; }
+          explain_tree.children_ = children;
+          ret = stmt_resolver_func<ObExplainResolver>(params_, explain_tree, stmt);
+        }
         break;
       }
       case T_ALTER_SYSTEM_SET: {
