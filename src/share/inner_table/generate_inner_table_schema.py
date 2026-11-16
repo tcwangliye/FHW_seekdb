@@ -782,9 +782,12 @@ def add_column(column, rowkey_id, index_id, part_key_pos, column_id=0, is_hidden
       column_type = 'ObLongTextType'
       column_length = 0
       column_collation_type = 'CS_TYPE_BINARY'
-    elif column_type == 'datetime':
+    elif column_type[:8] == 'datetime':
+      s = column_type.split(':')
       column_type = 'ObDateTimeType'
       column_length = 0
+      if len(s) > 1:
+        column_scale = s[1]
 
   if len(column) >= 3:
     is_nullable = column[2]
@@ -801,7 +804,8 @@ def add_column(column, rowkey_id, index_id, part_key_pos, column_id=0, is_hidden
   log_debug(column_name, rowkey_id, index_id, part_key_pos, column_type, column_length, is_nullable, is_autoincrement, default_value)
   if column_name.find("[discard]") == 0:
     print_discard_column(column_name)
-  elif column_type == 'ObTimestampType':
+  elif column_type == 'ObTimestampType' or (
+      column_type == 'ObDateTimeType' and default_value in ('CURRENT_TIMESTAMP', 'CURRENT_TIMESTAMP(6)', 'NOW()', 'NOW(6)')):
     print_timestamp_column(column_name, rowkey_id, index_id, part_key_pos, column_type, column_collation_type, column_length, column_precision, column_scale, is_nullable, is_autoincrement, column_id, is_on_update_for_timestamp, is_hidden, is_storing_column)
   elif default_value is None:
     print_column(column_name, rowkey_id, index_id, part_key_pos, column_type, column_collation_type, column_length, column_precision, column_scale, is_nullable, is_autoincrement, column_id, is_hidden, is_storing_column)

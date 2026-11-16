@@ -99,6 +99,15 @@ struct ObColumnResolveStat
   bool is_unique_key_;
 };
 
+struct AiColumnPending
+{
+  AiColumnPending() : column_name_(), expression_(), max_retries_(2), has_definition_(false) {}
+  common::ObString column_name_;
+  common::ObString expression_;
+  int64_t max_retries_;
+  bool has_definition_;
+};
+
 struct ObDefaultValueRes
 {
   ObDefaultValueRes(common::ObObjParam &value): is_literal_(true), value_(value) {}
@@ -517,7 +526,8 @@ protected:
       const ObTableSchema &table_schema,
       const bool unused_flag = false,
       const bool is_create_table_as = false,
-      const bool allow_has_default = true);
+      const bool allow_has_default = true,
+      AiColumnPending *ai_column = nullptr);
   int drop_not_null_constraint(const share::schema::ObColumnSchemaV2 &column);
   int resolve_normal_column_attribute_constr_not_null(ObColumnSchemaV2 &column,
                                                       ParseNode *attrs_node,
@@ -535,7 +545,8 @@ protected:
                                       common::ObString &pk_name,
                                       bool &is_modify_column,
                                       bool &is_modify_column_visibility,
-                                      const bool allow_has_default = true);
+                                      const bool allow_has_default = true,
+                                      AiColumnPending *ai_column = nullptr);
   int resolve_normal_column_attribute_check_cons(ObColumnSchemaV2 &column,
                                                  ParseNode *attrs_node,
                                                  ObCreateTableStmt *create_table_stmt);
@@ -545,6 +556,23 @@ protected:
   int resolve_generated_column_attribute(share::schema::ObColumnSchemaV2 &column,
                                          ParseNode *attrs_node,
                                          ObColumnResolveStat &reslove_stat);
+  int resolve_ai_column_attribute(const ParseNode &attr_node,
+                                  share::schema::ObColumnSchemaV2 &column,
+                                  AiColumnPending &pending);
+  int build_ai_column_spec(const share::schema::ObTableSchema &table_schema,
+                           const share::schema::ObColumnSchemaV2 &column,
+                           const AiColumnPending &pending,
+                           const uint64_t result_column_id,
+                           const uint64_t definition_version,
+                           common::ObString &spec,
+                           common::ObIArray<uint64_t> &dependency_ids);
+  int init_ai_hidden_column(share::schema::ObColumnSchemaV2 &column,
+                            const common::ObString &name,
+                            const uint64_t table_id,
+                            const uint64_t column_id,
+                            const common::ObObjType type,
+                            const common::ObString &default_value,
+                            const bool is_default_expr);
   int resolve_srid_node(share::schema::ObColumnSchemaV2 &column,
                         const ParseNode &srid_node);
   int resolve_column_skip_index(

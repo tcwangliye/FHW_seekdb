@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "config_bridge.h"
 #include "sql/resolver/ddl/ob_alter_table_resolver.h"
+#include "share/ai_column/ai_column_utils.h"
 #include "sql/resolver/expr/ob_raw_expr_part_expr_checker.h"
 #include "sql/resolver/dml/ob_delete_resolver.h"
 #include "sql/resolver/ddl/ob_index_builder_util.h"
@@ -3415,13 +3416,16 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
         stat.reset();
         bool is_modify_column_visibility = false;
         ObSEArray<ObColumnSchemaV2 *, 8> resolved_cols;
+        AiColumnPending ai_column;
         if (OB_FAIL(get_table_schema_all_column_schema(resolved_cols, alter_table_stmt->get_alter_table_schema()))) {
         } else if (OB_FAIL(resolve_alter_table_column_definition(alter_column_schema,
                                                           node.children_[i],
                                                           stat,
                                                           is_modify_column_visibility,
                                                           resolved_cols,
-                                                          false))) {
+                                                          false,
+                                                          true,
+                                                          &ai_column))) {
         } else if (OB_FAIL(fill_column_schema_according_stat(stat, alter_column_schema))) {
         } else if (OB_FAIL(set_column_collation(alter_column_schema))) {
         }
@@ -3453,7 +3457,67 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
           }
         }
 
-        //add column
+        if (OB_SUCC(ret) && ai_column.has_definition_) {
+          AlterTableSchema &alter_schema = alter_table_stmt->get_alter_table_arg().alter_table_schema_;
+          uint64_t previous_add_count = 0;
+          for (int64_t a = 0; a < alter_schema.get_column_count(); ++a) {
+            const ObColumnSchemaV2 *action = alter_schema.get_column_schema_by_idx(a);
+            if (OB_ISNULL(action)) {
+              ret = OB_ERR_UNEXPECTED;
+            } else if (OB_DDL_ADD_COLUMN == static_cast<const AlterColumnSchema *>(action)->alter_type_) {
+              ++previous_add_count;
+            }
+          }
+          const uint64_t result_column_id = table_schema_->get_max_used_column_id() + previous_add_count + 4;
+          ObString spec;
+          ObSEArray<uint64_t, 8> dependency_ids;
+          if (OB_FAIL(ret)) {
+          } else if (OB_FAIL(build_ai_column_spec(*table_schema_, alter_column_schema, ai_column,
+                                                  result_column_id, 1, spec, dependency_ids))) {
+          } else {
+            char state_name_buf[64];
+            char request_name_buf[64];
+            char spec_name_buf[64];
+            const int state_len = snprintf(state_name_buf, sizeof(state_name_buf), "__ai_state_%lu",
+                                           static_cast<unsigned long>(result_column_id));
+            const int request_len = snprintf(request_name_buf, sizeof(request_name_buf), "__ai_request_%lu",
+                                             static_cast<unsigned long>(result_column_id));
+            const int spec_len = snprintf(spec_name_buf, sizeof(spec_name_buf), "__ai_spec_%lu",
+                                          static_cast<unsigned long>(result_column_id));
+            if (state_len <= 0 || state_len >= static_cast<int>(sizeof(state_name_buf))
+                || request_len <= 0 || request_len >= static_cast<int>(sizeof(request_name_buf))
+                || spec_len <= 0 || spec_len >= static_cast<int>(sizeof(spec_name_buf))) {
+              ret = OB_SIZE_OVERFLOW;
+            } else {
+              AlterColumnSchema state_column;
+              AlterColumnSchema request_column;
+              AlterColumnSchema spec_column;
+              const ObString state_name(state_len, state_name_buf);
+              const ObString request_name(request_len, request_name_buf);
+              const ObString spec_name(spec_len, spec_name_buf);
+              const ObString pending_value = ObString::make_string("PENDING");
+              const ObString request_expr = ObString::make_string("UUID_SHORT()");
+              state_column.alter_type_ = OB_DDL_ADD_COLUMN;
+              request_column.alter_type_ = OB_DDL_ADD_COLUMN;
+              spec_column.alter_type_ = OB_DDL_ADD_COLUMN;
+              if (OB_FAIL(init_ai_hidden_column(state_column, state_name, table_schema_->get_table_id(),
+                                                table_schema_->get_max_used_column_id() + previous_add_count + 1,
+                                                ObVarcharType, pending_value, false))) {
+              } else if (OB_FAIL(alter_table_stmt->add_column(state_column))) {
+              } else if (OB_FAIL(init_ai_hidden_column(request_column, request_name, table_schema_->get_table_id(),
+                                                     table_schema_->get_max_used_column_id() + previous_add_count + 2,
+                                                     ObUInt64Type, request_expr, true))) {
+              } else if (OB_FAIL(alter_table_stmt->add_column(request_column))) {
+              } else if (OB_FAIL(init_ai_hidden_column(spec_column, spec_name, table_schema_->get_table_id(),
+                                                     table_schema_->get_max_used_column_id() + previous_add_count + 3,
+                                                     ObVarcharType, spec, false))) {
+              } else if (OB_FAIL(alter_table_stmt->add_column(spec_column))) {
+              } else {
+                alter_column_schema.set_column_id(result_column_id);
+              }
+            }
+          }
+        }
         if (OB_SUCC(ret)) {
           if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
@@ -3512,7 +3576,8 @@ int ObAlterTableResolver::resolve_alter_table_column_definition(AlterColumnSchem
                                                                 bool &is_modify_column_visibility,
                                                         ObIArray<ObColumnSchemaV2 *> &resolved_cols,
                                                                 const bool unused_flag,
-                                                                const bool allow_has_default)
+                                                                const bool allow_has_default,
+                                                                AiColumnPending *ai_column)
 {
   int ret = OB_SUCCESS;
   common::ObString pk_name;
@@ -3528,7 +3593,8 @@ int ObAlterTableResolver::resolve_alter_table_column_definition(AlterColumnSchem
               is_modify_column_visibility, pk_name, *table_schema_,
               false,
               false,
-              allow_has_default))) {
+              allow_has_default,
+              ai_column))) {
   } else { // add column level constraint
     add_or_modify_check_cst_times_ += alter_table_schema.get_constraint_count() - cst_cnt;
   }
@@ -4007,6 +4073,7 @@ int ObAlterTableResolver::resolve_modify_column(const ParseNode &node,
     for (int i = 0; OB_SUCC(ret) && i < node.num_child_; ++i) {
       alter_column_schema.reset();
       stat.reset();
+      AiColumnPending ai_column;
       const ObColumnSchemaV2 *origin_col_schema = NULL;
       ObString column_name;
       ObAlterTableStmt *alter_table_stmt = get_alter_table_stmt();
@@ -4052,7 +4119,8 @@ int ObAlterTableResolver::resolve_modify_column(const ParseNode &node,
                     alter_column_schema, node.children_[i], stat, is_modify_column_visibility,
                     resolved_cols,
                     false,
-                    allow_has_default))) {
+                    allow_has_default,
+                    &ai_column))) {
         } else if (!stat.is_primary_key_ &&
                    OB_FAIL(resolve_alter_column_not_null(alter_column_schema, *origin_col_schema))) {
         }
@@ -4075,6 +4143,95 @@ int ObAlterTableResolver::resolve_modify_column(const ParseNode &node,
         }
         if (OB_SUCC(ret)) {
           if (OB_FAIL(check_column_in_part_key(*table_schema_, *origin_col_schema, alter_column_schema))) {
+          }
+        }
+        if (OB_SUCC(ret) && ai_column.has_definition_) {
+          const uint64_t result_column_id = origin_col_schema->get_column_id();
+          const bool existed_as_ai = origin_col_schema->is_ai_column();
+          uint64_t definition_version = 1;
+          if (existed_as_ai) {
+            ObSEArray<share::AiColumnDefinition, 4> definitions;
+            bool found_definition = false;
+            if (OB_FAIL(share::AiColumnUtils::get_definitions(*table_schema_, *allocator_, definitions))) {
+            } else {
+              for (int64_t d = 0; !found_definition && d < definitions.count(); ++d) {
+                if (definitions.at(d).column_id_ == result_column_id) {
+                  definition_version = definitions.at(d).definition_version_ + 1;
+                  found_definition = true;
+                }
+              }
+              if (!found_definition) { ret = OB_ERR_UNEXPECTED; }
+            }
+          }
+          ObString spec;
+          ObSEArray<uint64_t, 8> dependency_ids;
+          if (OB_SUCC(ret) && OB_FAIL(build_ai_column_spec(*table_schema_, alter_column_schema,
+                                                           ai_column, result_column_id,
+                                                           definition_version, spec, dependency_ids))) {
+          }
+          char state_name_buf[64];
+          char request_name_buf[64];
+          char spec_name_buf[64];
+          const int state_len = snprintf(state_name_buf, sizeof(state_name_buf), "__ai_state_%lu",
+                                         static_cast<unsigned long>(result_column_id));
+          const int request_len = snprintf(request_name_buf, sizeof(request_name_buf), "__ai_request_%lu",
+                                           static_cast<unsigned long>(result_column_id));
+          const int spec_len = snprintf(spec_name_buf, sizeof(spec_name_buf), "__ai_spec_%lu",
+                                        static_cast<unsigned long>(result_column_id));
+          if (OB_SUCC(ret) && (state_len <= 0 || state_len >= static_cast<int>(sizeof(state_name_buf))
+              || request_len <= 0 || request_len >= static_cast<int>(sizeof(request_name_buf))
+              || spec_len <= 0 || spec_len >= static_cast<int>(sizeof(spec_name_buf)))) {
+            ret = OB_SIZE_OVERFLOW;
+          }
+          if (OB_SUCC(ret)) {
+            const ObString state_name(state_len, state_name_buf);
+            const ObString request_name(request_len, request_name_buf);
+            const ObString spec_name(spec_len, spec_name_buf);
+            const ObString pending_value = ObString::make_string("PENDING");
+            const ObString request_expr = ObString::make_string("UUID_SHORT()");
+            AlterTableSchema &alter_schema = alter_table_stmt->get_alter_table_arg().alter_table_schema_;
+            if (existed_as_ai) {
+              const ObColumnSchemaV2 *old_spec = table_schema_->get_column_schema(spec_name);
+              AlterColumnSchema spec_column;
+              spec_column.alter_type_ = OB_DDL_MODIFY_COLUMN;
+              if (OB_ISNULL(old_spec)) {
+                ret = OB_ERR_UNEXPECTED;
+              } else if (OB_FAIL(init_ai_hidden_column(spec_column, spec_name, table_schema_->get_table_id(),
+                                                      old_spec->get_column_id(), ObVarcharType, spec, false))) {
+              } else if (OB_FAIL(spec_column.set_origin_column_name(spec_name))) {
+              } else if (OB_FAIL(alter_table_stmt->add_column(spec_column))) {
+              }
+            } else {
+              uint64_t previous_add_count = 0;
+              for (int64_t a = 0; OB_SUCC(ret) && a < alter_schema.get_column_count(); ++a) {
+                const ObColumnSchemaV2 *action = alter_schema.get_column_schema_by_idx(a);
+                if (OB_ISNULL(action)) {
+                  ret = OB_ERR_UNEXPECTED;
+                } else if (OB_DDL_ADD_COLUMN == static_cast<const AlterColumnSchema *>(action)->alter_type_) {
+                  ++previous_add_count;
+                }
+              }
+              AlterColumnSchema state_column;
+              AlterColumnSchema request_column;
+              AlterColumnSchema spec_column;
+              state_column.alter_type_ = OB_DDL_ADD_COLUMN;
+              request_column.alter_type_ = OB_DDL_ADD_COLUMN;
+              spec_column.alter_type_ = OB_DDL_ADD_COLUMN;
+              if (OB_FAIL(ret)) {
+              } else if (OB_FAIL(init_ai_hidden_column(state_column, state_name, table_schema_->get_table_id(),
+                      table_schema_->get_max_used_column_id() + previous_add_count + 1,
+                      ObVarcharType, pending_value, false))) {
+              } else if (OB_FAIL(alter_table_stmt->add_column(state_column))) {
+              } else if (OB_FAIL(init_ai_hidden_column(request_column, request_name, table_schema_->get_table_id(),
+                      table_schema_->get_max_used_column_id() + previous_add_count + 2,
+                      ObUInt64Type, request_expr, true))) {
+              } else if (OB_FAIL(alter_table_stmt->add_column(request_column))) {
+              } else if (OB_FAIL(init_ai_hidden_column(spec_column, spec_name, table_schema_->get_table_id(),
+                      table_schema_->get_max_used_column_id() + previous_add_count + 3,
+                      ObVarcharType, spec, false))) {
+              } else if (OB_FAIL(alter_table_stmt->add_column(spec_column))) {
+              }
+            }
           }
         }
         if (OB_SUCC(ret)) {

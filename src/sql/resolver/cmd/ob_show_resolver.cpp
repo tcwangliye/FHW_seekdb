@@ -395,7 +395,11 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
                */
               bool is_full = (1 == ((parse_tree.children_[0]->value_)&1));
               bool is_extended = (1 == (((parse_tree.children_[0]->value_)>>1)&1));
-              if (OB_UNLIKELY(((parse_tree.children_[0]->value_)>>2) != 0)) {
+              const bool is_ai_columns = (parse_tree.children_[0]->value_ & 4) != 0;
+              if (is_ai_columns) {
+                GEN_SQL_STEP_1(ObShowSqlSet::SHOW_AI_COLUMNS);
+                GEN_SQL_STEP_2(ObShowSqlSet::SHOW_AI_COLUMNS, OB_SYS_DATABASE_NAME, OB_ALL_AI_COLUMN_TNAME, show_table_id);
+              } else if (OB_UNLIKELY(((parse_tree.children_[0]->value_)>>2) != 0)) {
                 ret = OB_ERR_UNEXPECTED;
               } else if (is_full) {
                 if (is_extended) {
@@ -2369,6 +2373,11 @@ DEFINE_SHOW_CLAUSE_SET(SHOW_GLOBAL_VARIABLES,
                        "SELECT /*+parallel(1)*/ variable_name AS `Variable_name`, value AS `Value` FROM %s.%s ORDER BY variable_name ASC",
                        R"(SELECT /*+parallel(1)*/ "VARIABLE_NAME" AS "VARIABLE_NAME", "VALUE" AS "VALUE" FROM %s.%s ORDER BY VARIABLE_NAME ASC)",
                        "Variable_name");
+DEFINE_SHOW_CLAUSE_SET(SHOW_AI_COLUMNS,
+                       NULL,
+                       "SELECT column_name AS `Column`, expression AS `Expression`, normalized_expr AS `Normalized Expression`, dependency_ids AS `Dependencies`, max_retries AS `Max Retries`, definition_version AS `Definition Version` FROM %s.%s WHERE tenant_id = 1 AND table_id = %ld ORDER BY column_id",
+                       NULL,
+                       NULL);
 DEFINE_SHOW_CLAUSE_SET(SHOW_COLUMNS,
                        NULL,
                        "SELECT field AS `Field`, type AS `Type`, `NULL` AS `Null`, `KEY` AS `Key`, `DEFAULT` AS `Default`, extra AS `Extra` \

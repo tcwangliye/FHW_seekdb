@@ -34,6 +34,9 @@
 #include "sql/engine/ob_batch_rows.h"
 #include "sql/engine/ob_physical_plan.h"
 #include "query/vector/ob_vector_index_util.h"
+#include "share/ai_column/ai_column_utils.h"
+#include "share/ob_dml_sql_splicer.h"
+#include "share/schema/ob_schema_getter_guard.h"
 namespace oceanbase
 {
 using namespace common;
@@ -41,6 +44,180 @@ using namespace share;
 using namespace transaction;
 namespace sql
 {
+
+namespace {
+int64_t ai_column_index(const ObDMLBaseCtDef &ctdef, uint64_t column_id)
+{
+  int64_t result = -1;
+  for (int64_t i = 0; result < 0 && i < ctdef.column_ids_.count(); ++i) {
+    if (ctdef.column_ids_.at(i) == column_id) { result = i; }
+  }
+  return result;
+}
+
+bool ai_column_regenerated(const ObDMLBaseCtDef &ctdef, const AiColumnDefinition &def)
+{
+  bool result = ctdef.dml_type_ == DAS_OP_TABLE_INSERT;
+  if (ctdef.dml_type_ == DAS_OP_TABLE_UPDATE) {
+    const int64_t request_index = ai_column_index(ctdef, def.request_column_id_);
+    const ObUpdCtDef &update = static_cast<const ObUpdCtDef &>(ctdef);
+    for (int64_t i = 0; !result && i < update.assign_columns_.count(); ++i) {
+      result = update.assign_columns_.at(i).projector_index_ == request_index;
+    }
+  }
+  return result;
+}
+
+int ai_column_definitions(const ObDMLBaseCtDef &ctdef, ObTableModifyOp &op,
+    ObIAllocator &allocator, const share::schema::ObTableSchema *&table,
+    ObIArray<AiColumnDefinition> &definitions)
+{
+  int ret = OB_SUCCESS;
+  table = nullptr;
+  if (ctdef.has_ai_columns_ && !AiColumnInternalGuard::worker()) {
+    auto *guard = op.get_exec_ctx().get_sql_ctx()->schema_guard_;
+    if (OB_ISNULL(guard)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(guard->get_table_schema(ctdef.das_base_ctdef_.index_tid_, table))) {
+    } else if (OB_ISNULL(table)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      OZ(AiColumnUtils::get_definitions(*table, allocator, definitions));
+    }
+  }
+  return ret;
+}
+
+int prepare_ai_column_row(const ObDMLBaseCtDef &ctdef, ObTableModifyOp &op)
+{
+  int ret = OB_SUCCESS;
+  if (ctdef.has_ai_columns_ && !AiColumnInternalGuard::worker()) {
+    ObArenaAllocator allocator("AiColumnDml");
+    ObSEArray<AiColumnDefinition, 4> definitions;
+    const share::schema::ObTableSchema *table = nullptr;
+    uint64_t request_id = 0;
+    OZ(ai_column_definitions(ctdef, op, allocator, table, definitions));
+    for (int64_t i = 0; OB_SUCC(ret) && i < definitions.count(); ++i) {
+      const AiColumnDefinition &def = definitions.at(i);
+      if (!ai_column_regenerated(ctdef, def)) { continue; }
+      const int64_t index = ai_column_index(ctdef, def.request_column_id_);
+      ObDatum *datum = nullptr;
+      if (index < 0 || index >= ctdef.new_row_.count()) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(ctdef.new_row_.at(index)->eval(op.get_eval_ctx(), datum))) {
+      } else if (OB_ISNULL(datum) || datum->is_null()) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        // Each request expression is volatile. Share the first UUID across this row's group.
+        if (request_id == 0) { request_id = datum->get_uint(); }
+        datum->set_uint(request_id);
+      }
+    }
+  }
+  return ret;
+}
+
+int ai_column_rowkey(const ObDMLBaseCtDef &ctdef, const share::schema::ObTableSchema &table,
+    const ExprFixedArray &row, ObTableModifyOp &op, ObIAllocator &allocator, ObSqlString &predicate)
+{
+  int ret = OB_SUCCESS;
+  const auto &rowkey = table.get_rowkey_info();
+  for (int64_t i = 0; OB_SUCC(ret) && i < rowkey.get_size(); ++i) {
+    uint64_t id = OB_INVALID_ID;
+    OZ(rowkey.get_column_id(i, id));
+    const int64_t index = ai_column_index(ctdef, id);
+    const auto *column = table.get_column_schema(id);
+    ObDatum *datum = nullptr;
+    ObObj value;
+    char *buffer = nullptr;
+    int64_t length = 0;
+    int64_t position = 0;
+    if (OB_FAIL(ret)) {
+    } else if (index < 0 || index >= row.count() || OB_ISNULL(column)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(row.at(index)->eval(op.get_eval_ctx(), datum))) {
+    } else if (OB_FAIL(datum->to_obj(value, row.at(index)->obj_meta_))) {
+    } else if (OB_FAIL(value.print_sql_literal(buffer, length, position, allocator, op.get_obj_print_params()))) {
+    } else {
+      if (i > 0) { OZ(predicate.append(" AND ")); }
+      OZ(AiColumnUtils::quote_identifier(column->get_column_name_str(), predicate));
+      OZ(predicate.append(" = "));
+      OZ(predicate.append(ObString(static_cast<int32_t>(position), buffer)));
+    }
+  }
+  return ret;
+}
+
+int maintain_ai_column_tasks(const ObDMLBaseCtDef &ctdef, ObTableModifyOp &op,
+    ObDmlEventType event)
+{
+  int ret = OB_SUCCESS;
+  if (ctdef.has_ai_columns_ && !AiColumnInternalGuard::worker()) {
+    ObArenaAllocator allocator("AiColumnDml");
+    ObSEArray<AiColumnDefinition, 4> definitions;
+    const share::schema::ObTableSchema *table = nullptr;
+    const bool deleting = event == ObDmlEventType::DE_DELETING;
+    const bool inserting = event == ObDmlEventType::DE_INSERTING;
+    ObSqlString old_key;
+    ObSqlString new_key;
+    OZ(ai_column_definitions(ctdef, op, allocator, table, definitions));
+    bool affected = deleting;
+    for (int64_t i = 0; !affected && i < definitions.count(); ++i) {
+      affected = ai_column_regenerated(ctdef, definitions.at(i));
+    }
+    if (OB_SUCC(ret) && affected && !definitions.empty()) {
+      if (!inserting) { OZ(ai_column_rowkey(ctdef, *table, ctdef.old_row_, op, allocator, old_key)); }
+      if (!deleting) { OZ(ai_column_rowkey(ctdef, *table, ctdef.new_row_, op, allocator, new_key)); }
+      OZ(op.open_inner_conn());
+      if (OB_SUCC(ret) && OB_SUCC(ret = op.begin_nested_session(false))) {
+        // Task-table writes are cascaded DML in the outer transaction.
+        const bool was_cascading = op.get_exec_ctx().get_das_ctx().is_fk_cascading_;
+        op.get_exec_ctx().get_das_ctx().is_fk_cascading_ = true;
+        for (int64_t i = 0; OB_SUCC(ret) && i < definitions.count(); ++i) {
+          const AiColumnDefinition &def = definitions.at(i);
+          if (!deleting && !ai_column_regenerated(ctdef, def)) { continue; }
+          ObSqlString sql;
+          ObDMLSqlSplicer remove;
+          OZ(remove.add_pk_column("tenant_id", static_cast<uint64_t>(1)));
+          OZ(remove.add_pk_column("table_id", table->get_table_id()));
+          OZ(remove.add_pk_column("column_id", def.column_id_));
+          OZ(remove.add_pk_column("rowkey_predicate", ObHexEscapeSqlStr(inserting ? new_key.string() : old_key.string())));
+          OZ(remove.splice_delete_sql("oceanbase.__all_ai_column_task", sql));
+          OZ(op.execute_write(sql.ptr()));
+          if (OB_SUCC(ret) && !deleting) {
+            const int64_t index = ai_column_index(ctdef, def.request_column_id_);
+            ObDatum *request = nullptr;
+            if (index < 0 || index >= ctdef.new_row_.count()) {
+              ret = OB_ERR_UNEXPECTED;
+            } else if (OB_FAIL(ctdef.new_row_.at(index)->eval(op.get_eval_ctx(), request))) {
+            } else {
+              ObDMLSqlSplicer insert;
+              sql.reset();
+              OZ(insert.add_pk_column("tenant_id", static_cast<uint64_t>(1)));
+              OZ(insert.add_pk_column("table_id", table->get_table_id()));
+              OZ(insert.add_pk_column("column_id", def.column_id_));
+              OZ(insert.add_pk_column("request_id", request->get_uint()));
+              OZ(insert.add_column("definition_version", def.definition_version_));
+              OZ(insert.add_column("column_name", ObHexEscapeSqlStr(def.column_name_)));
+              OZ(insert.add_column("rowkey_predicate", ObHexEscapeSqlStr(new_key.string())));
+              OZ(insert.add_column("normalized_expr", ObHexEscapeSqlStr(def.normalized_expr_)));
+              OZ(insert.add_column("max_retries", def.max_retries_));
+              OZ(insert.add_column("state", 1));
+              OZ(insert.add_column("retry_count", 0));
+              OZ(insert.splice_insert_sql("oceanbase.__all_ai_column_task", sql));
+              OZ(op.execute_write(sql.ptr()));
+            }
+          }
+        }
+        const int end_ret = op.end_nested_session();
+        op.get_exec_ctx().get_das_ctx().is_fk_cascading_ = was_cascading;
+        if (OB_SUCC(ret)) { ret = end_ret; }
+      }
+    }
+  }
+  return ret;
+}
+}
 
 bool ObDMLService::check_cascaded_reference(const ObExpr *expr, const ObExprPtrIArray &row)
 {
@@ -621,6 +798,7 @@ int ObDMLService::process_insert_row(const ObInsCtDef &ins_ctdef,
         dml_op, ins_ctdef.das_base_ctdef_, ins_ctdef.trig_ctdef_, ins_rtdef.trig_rtdef_))) {
     }
     if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(prepare_ai_column_row(ins_ctdef, dml_op))) {
     } else if (OB_FAIL(check_row_null(ins_ctdef.new_row_,
                                       dml_op.get_eval_ctx(),
                                       ins_rtdef.cur_row_num_,
@@ -793,6 +971,7 @@ int ObDMLService::process_update_row(const ObUpdCtDef &upd_ctdef,
           dml_op, upd_ctdef.das_base_ctdef_, upd_ctdef.trig_ctdef_, upd_rtdef.trig_rtdef_))) {
       }
       if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(prepare_ai_column_row(upd_ctdef, dml_op))) {
       } else if (OB_FAIL(check_row_null(upd_ctdef.new_row_,
                                         dml_op.get_eval_ctx(),
                                         upd_rtdef.cur_row_num_,
@@ -2165,6 +2344,8 @@ int ObDMLService::handle_after_processing_multi_row(ObDMLModifyRowsList *dml_mod
             }
           }
         }
+        if (OB_SUCC(ret) && OB_FAIL(maintain_ai_column_tasks(dml_ctdef, op, dml_event))) {
+        }
         // process after row trigger
         if (OB_SUCC(ret) && dml_ctdef.trig_ctdef_.all_tm_points_.has_after_row()) {
           ObEvalCtx &eval_ctx = op.get_eval_ctx();
@@ -2216,6 +2397,8 @@ int ObDMLService::handle_after_processing_single_row(ObDMLModifyRowNode &modify_
         }
       } else if (OB_FAIL(ForeignKeyHandle::do_handle(op, dml_ctdef, dml_rtdef))) {
       }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(maintain_ai_column_tasks(dml_ctdef, op, dml_event))) {
     }
     if (OB_SUCC(ret) && OB_FAIL(TriggerHandle::do_handle_after_row(op, dml_ctdef.trig_ctdef_, dml_rtdef.trig_rtdef_, dml_event))) {
     }

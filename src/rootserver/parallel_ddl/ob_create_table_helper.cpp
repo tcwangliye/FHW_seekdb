@@ -23,6 +23,7 @@
 #include "rootserver/freeze/ob_major_freeze_helper.h"
 #include "sql/resolver/ddl/ob_index_builder_util.h"
 #include "share/schema/ob_table_sql_service.h"
+#include "share/inner_table/ob_inner_table_schema.h"
 #include "query/vector/ob_vector_index_util.h"
 #include "sql/resolver/ob_resolver_utils.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
@@ -507,7 +508,8 @@ int ObCreateTableHelper::generate_table_schema_()
 
     // to make try_format_partition_schema() passed
     if (OB_FAIL(new_table.assign(arg_.schema_))) {
-    } else if (OB_FAIL(inner_generate_table_schema_(arg_, new_table))) {
+    } else if (!(arg_.is_inner_ && arg_.schema_.is_sys_table())
+               && OB_FAIL(inner_generate_table_schema_(arg_, new_table))) {
     }
 
     if (FAILEDx(new_tables_.push_back(new_table))) {
@@ -522,6 +524,15 @@ int ObCreateTableHelper::generate_aux_table_schemas_()
   if (OB_FAIL(check_inner_stat_())) {
   } else if (OB_UNLIKELY(new_tables_.count() <= 0)) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (arg_.is_inner_ && arg_.schema_.is_sys_table()) {
+    if (arg_.schema_.has_lob_column(true)) {
+      HEAP_VARS_2((ObTableSchema, lob_meta_schema), (ObTableSchema, lob_piece_schema)) {
+        OZ(get_sys_table_lob_aux_schema(arg_.schema_.get_table_id(),
+                                       lob_meta_schema, lob_piece_schema));
+        OZ(new_tables_.push_back(lob_meta_schema));
+        OZ(new_tables_.push_back(lob_piece_schema));
+      }
+    }
   } else if (OB_FAIL(inner_generate_aux_table_schema_(arg_))) {
   } else if (OB_UNLIKELY(new_tables_.count() <= 0)) {
     ret = OB_ERR_UNEXPECTED;

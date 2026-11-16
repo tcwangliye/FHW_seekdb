@@ -1680,7 +1680,8 @@ int ObSelectResolver::expand_target_list(
         tmp_select_item.need_check_dup_name_ = select_item.need_check_dup_name_;
       }
     }
-    if (OB_SUCC(ret)) {
+    if (OB_SUCC(ret) && OB_FAIL(check_ai_column_strict_read(col_item.expr_))) {
+    } else if (OB_SUCC(ret)) {
       tmp_select_item.alias_name_ = col_item.column_name_;
       tmp_select_item.expr_name_ = col_item.column_name_;
       tmp_select_item.is_real_alias_ = false;
@@ -3250,6 +3251,7 @@ int ObSelectResolver::resolve_column_ref_expr(
   }
   if (OB_SUCC(ret) && OB_FAIL(resolve_column_ref_in_all_namespace(q_name, real_ref_expr))) {
     LOG_WARN_IGNORE_COL_NOTFOUND(ret, "resolve column ref in all namespace failed", K(ret));
+  } else if (OB_SUCC(ret) && OB_FAIL(check_ai_column_strict_read(real_ref_expr))) {
   }
   return ret;
 }

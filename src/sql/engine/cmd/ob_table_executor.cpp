@@ -42,6 +42,8 @@
 
 #include "sql/printer/ob_select_stmt_printer.h"
 #include "share/ob_structured_event_logger.h"
+#include "share/ai_column/ai_column_utils.h"
+#include "share/inner_table/ob_inner_table_schema.h"
 namespace oceanbase
 {
 using namespace common;
@@ -50,6 +52,36 @@ using namespace share::schema;
 using namespace observer;
 namespace sql
 {
+
+static int ensure_ai_column_tables(ObExecContext &ctx, const ObTableSchema &table)
+{
+  int ret = OB_SUCCESS;
+  if (AiColumnUtils::has_ai_columns(table)) {
+    ObSchemaGetterGuard schema_guard;
+    OZ(GCTX.schema_service_->get_runtime_schema_guard(schema_guard));
+    const uint64_t table_ids[] = {OB_ALL_AI_COLUMN_TID, OB_ALL_AI_COLUMN_TASK_TID};
+    for (int64_t i = 0; OB_SUCC(ret) && i < 2; ++i) {
+      const ObTableSchema *inner_table = nullptr;
+      OZ(schema_guard.get_table_schema(table_ids[i], inner_table));
+      if (OB_SUCC(ret) && nullptr == inner_table) {
+        obcall::ObCreateTableArg arg;
+        obcall::ObCreateTableRes res;
+        arg.db_name_ = ObString::make_string(OB_SYS_DATABASE_NAME);
+        arg.is_inner_ = true;
+        arg.if_not_exist_ = true;
+        arg.is_parallel_ = false;
+        if (0 == i) {
+          OZ(ObInnerTableSchema::all_ai_column_schema(arg.schema_));
+        } else {
+          OZ(ObInnerTableSchema::all_ai_column_task_schema(arg.schema_));
+        }
+        OZ(ObDDLExecutorUtil::execute_pcreate_table(ctx.get_my_session(),
+            ctx.root_command_service(), "create AI column system table", arg, res));
+      }
+    }
+  }
+  return ret;
+}
 
 ObCreateTableExecutor::ObCreateTableExecutor()
 {
@@ -470,6 +502,7 @@ int ObCreateTableExecutor::execute(ObExecContext &ctx, ObCreateTableStmt &stmt)
       ret = OB_NOT_INIT;
     } else if (OB_FAIL(ObPartitionExecutorUtils::calc_values_exprs(ctx, stmt))) {
     } else if (OB_FAIL(set_index_arg_list(ctx, stmt))) {
+    } else if (OB_FAIL(ensure_ai_column_tables(ctx, table_schema))) {
     } else if (OB_ISNULL(select_stmt)) { // Processing for normal table creation
       bool &is_parallel_create = create_table_arg.is_parallel_;
       if (OB_FAIL(ctx.get_sql_ctx()->schema_guard_->reset())){
@@ -760,6 +793,7 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
   ObString first_stmt;
   OZ (stmt.get_first_stmt(first_stmt));
   OV (OB_NOT_NULL(task_exec_ctx = GET_SQL_EXECUTOR_CTX(ctx)), OB_NOT_INIT);
+  OZ(ensure_ai_column_tables(ctx, alter_table_arg.alter_table_schema_));
   if (OB_FAIL(ret)) {
     // do nothing
   } else if (stmt.is_alter_triggers()) {
@@ -864,6 +898,38 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
         } else if (OB_FAIL(ObDDLExecutorUtil::wait_ddl_finish(
             res.task_id_, res.ddl_need_retry_at_executor_, my_session,
             *ctx.get_query_runtime_environment(), ctx.local_command_service(), is_support_cancel))) {
+        }
+      }
+    }
+    // Populate added/redefined AI columns through normal DML after the schema is visible.
+    if (OB_SUCC(ret)) {
+      const AlterTableSchema &alter_schema = alter_table_arg.alter_table_schema_;
+      ObSqlString assignments;
+      for (auto it = alter_schema.column_begin(); OB_SUCC(ret) && it != alter_schema.column_end(); ++it) {
+        const AlterColumnSchema *column = static_cast<const AlterColumnSchema *>(*it);
+        if (column->is_ai_column() && (column->alter_type_ == OB_DDL_ADD_COLUMN
+            || column->alter_type_ == OB_DDL_MODIFY_COLUMN)) {
+          if (assignments.length() > 0) { OZ(assignments.append(", ")); }
+          OZ(AiColumnUtils::quote_identifier(column->get_column_name_str(), assignments));
+          OZ(assignments.append(" = NULL"));
+        }
+      }
+      if (OB_SUCC(ret) && assignments.length() > 0) {
+        ObSqlString sql;
+        const ObString &database = alter_schema.get_database_name().empty()
+            ? alter_schema.get_origin_database_name() : alter_schema.get_database_name();
+        const ObString &table = alter_schema.get_table_name_str().empty()
+            ? alter_schema.get_origin_table_name() : alter_schema.get_table_name_str();
+        OZ(sql.append("UPDATE "));
+        OZ(AiColumnUtils::quote_identifier(database, sql));
+        OZ(sql.append("."));
+        OZ(AiColumnUtils::quote_identifier(table, sql));
+        OZ(sql.append(" SET "));
+        OZ(sql.append(assignments.string()));
+        if (OB_SUCC(ret)) {
+          AiColumnInternalGuard retry_guard(true);
+          int64_t affected_rows = 0;
+          OZ(ctx.get_sql_proxy()->write(sql.ptr(), affected_rows));
         }
       }
     }

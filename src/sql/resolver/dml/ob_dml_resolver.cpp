@@ -42,6 +42,9 @@
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/hybrid_search/ob_hybrid_search_executor.h"
 #include "share/file_sql/ob_file_sql_utils.h"
+#include "share/ai_column/ai_column_utils.h"
+#include "query/api/query/session/ob_inner_sql_connection_access.h"
+#include "sql/session/ob_inner_sql_connection.h"
 
 namespace oceanbase
 {
@@ -1840,6 +1843,9 @@ int ObDMLResolver::resolve_basic_column_item(const TableItem &table_item,
   if (NULL == stmt) {
     stmt = get_stmt();
   }
+  if (AiColumnInternalGuard::active()) {
+    include_hidden = true;
+  }
   if (OB_ISNULL(stmt)
       || OB_ISNULL(schema_checker_)
       || OB_ISNULL(schema_guard = schema_checker_->get_schema_guard())
@@ -2248,6 +2254,137 @@ int ObDMLResolver::resolve_column_ref_expr(const ObQualifiedName &q_name, ObRawE
   int ret = OB_SUCCESS;
   if (OB_FAIL(resolve_table_column_expr(q_name, real_ref_expr))) {
     LOG_WARN_IGNORE_COL_NOTFOUND(ret, "resolve table column failed", K(q_name), K(ret));
+  } else if (OB_FAIL(check_ai_column_strict_read(real_ref_expr))) {
+  }
+  return ret;
+}
+
+int ObDMLResolver::check_ai_column_strict_read(ObRawExpr *expr)
+{
+  int ret = OB_SUCCESS;
+  if (AiColumnInternalGuard::active() || OB_ISNULL(expr) || !expr->is_column_ref_expr()) {
+    // Internal AI SQL and non-column expressions do not participate.
+  } else {
+    ObColumnRefRawExpr *column_ref = static_cast<ObColumnRefRawExpr *>(expr);
+    ObDMLStmt *stmt = get_stmt();
+    TableItem *table_item = NULL;
+    const ObTableSchema *table_schema = NULL;
+    const ObColumnSchemaV2 *column_schema = NULL;
+    if (OB_ISNULL(stmt) ||
+        OB_ISNULL(table_item = stmt->get_table_item_by_id(column_ref->get_table_id())) ||
+        !table_item->is_basic_table()) {
+      // A derived-table or outer-query reference is checked at its source resolver.
+    } else if (OB_ISNULL(schema_checker_) || OB_ISNULL(allocator_) || OB_ISNULL(session_info_)) {
+      ret = OB_NOT_INIT;
+    } else if (OB_FAIL(schema_checker_->get_table_schema(table_item->ref_id_, table_schema))) {
+    } else if (OB_ISNULL(table_schema) ||
+               OB_ISNULL(column_schema = table_schema->get_column_schema(column_ref->get_column_id()))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (AiColumnUtils::has_ai_columns(*table_schema) && column_schema->is_ai_column()) {
+      ObSEArray<AiColumnDefinition, 4> definitions;
+      bool is_ai_column = false;
+      if (OB_FAIL(AiColumnUtils::get_definitions(*table_schema, *allocator_, definitions))) {
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && !is_ai_column && i < definitions.count(); ++i) {
+          is_ai_column = definitions.at(i).column_id_ == column_ref->get_column_id();
+        }
+      }
+      if (OB_SUCC(ret) && is_ai_column) {
+        if (OB_NOT_NULL(params_.query_ctx_)) {
+          ObGlobalHint &hint = const_cast<ObGlobalHint &>(
+              params_.query_ctx_->get_query_hint().get_global_hint());
+          hint.merge_plan_cache_hint(OB_USE_PLAN_CACHE_NONE);
+        }
+        ObObj strict_read;
+        if (OB_FAIL(session_info_->get_sys_variable(SYS_VAR_AI_COLUMN_STRICT_READ, strict_read))) {
+        } else if (0 != strict_read.get_int()) {
+          const AiColumnDefinition *definition = NULL;
+          for (int64_t i = 0; OB_SUCC(ret) && NULL == definition && i < definitions.count(); ++i) {
+            if (definitions.at(i).column_id_ == column_ref->get_column_id()) {
+              definition = &definitions.at(i);
+            }
+          }
+          const ObColumnSchemaV2 *state_column = NULL;
+          const ObDatabaseSchema *database_schema = NULL;
+          ObSqlString inner_sql;
+          if (OB_ISNULL(definition) ||
+              OB_ISNULL(state_column = table_schema->get_column_schema(definition->state_column_id_))) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(schema_checker_->get_database_schema(
+                         table_schema->get_database_id(), database_schema))) {
+          } else if (OB_ISNULL(database_schema)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(inner_sql.append("SELECT 1 FROM ")) ||
+                     OB_FAIL(AiColumnUtils::quote_identifier(
+                         database_schema->get_database_name_str(), inner_sql)) ||
+                     OB_FAIL(inner_sql.append(".")) ||
+                     OB_FAIL(AiColumnUtils::quote_identifier(
+                         table_schema->get_table_name_str(), inner_sql)) ||
+                     OB_FAIL(inner_sql.append(" WHERE (")) ||
+                     OB_FAIL(AiColumnUtils::quote_identifier(
+                         state_column->get_column_name_str(), inner_sql)) ||
+                     OB_FAIL(inner_sql.append(" IS NULL OR ")) ||
+                     OB_FAIL(AiColumnUtils::quote_identifier(
+                         state_column->get_column_name_str(), inner_sql)) ||
+                     OB_FAIL(inner_sql.append(" <> 'READY') LIMIT 1"))) {
+          } else {
+            common::sqlclient::ObISQLConnectionGuard conn_guard;
+            if (OB_FAIL(query::ObInnerSQLConnectionAccess::create_connection_with_external_session(
+                    session_info_, conn_guard))) {
+            } else if (OB_ISNULL(conn_guard.get_ptr())) {
+              ret = OB_ERR_UNEXPECTED;
+            } else {
+              ObIInnerSQLConnection *conn = as_inner_sql_connection(conn_guard.get_ptr());
+              if (OB_ISNULL(conn)) {
+                ret = OB_ERR_UNEXPECTED;
+              } else {
+                ObSQLSessionInfo::StmtSavedValue saved_session;
+                const int64_t saved_nested_count = session_info_->get_nested_count();
+                if (OB_FAIL(session_info_->save_session(saved_session))) {
+                } else {
+                  session_info_->set_nested_count(-1);
+                  session_info_->set_autocommit(saved_session.inc_autocommit_);
+                  bool incomplete = false;
+                  {
+                    AiColumnInternalGuard internal_guard(false);
+                    SMART_VAR(ObMySQLProxy::MySQLResult, result) {
+                      if (OB_FAIL(conn->execute_read(
+                              inner_sql.string(), result,
+                              session_info_->is_user_session() &&
+                                  !session_info_->is_real_inner_session()))) {
+                      } else if (OB_ISNULL(result.get_result())) {
+                        ret = OB_ERR_UNEXPECTED;
+                      } else {
+                        int read_ret = result.get_result()->next();
+                        if (OB_SUCCESS == read_ret) {
+                          incomplete = true;
+                        } else if (OB_ITER_END != read_ret) {
+                          ret = read_ret;
+                        }
+                      }
+                    }
+                  }
+                  int tmp_ret = OB_SUCCESS;
+                  if (OB_SUCCESS != (tmp_ret = session_info_->restore_session(saved_session))) {
+                    LOG_ERROR("failed to restore session after AI column strict-read check",
+                              K(tmp_ret));
+                    ret = COVER_SUCC(tmp_ret);
+                  }
+                  session_info_->set_nested_count(saved_nested_count);
+                  saved_session.reset();
+                  if (OB_SUCC(ret) && incomplete) {
+                    ret = OB_ERR_AI_COLUMN_STRICT_READ;
+                    LOG_USER_ERROR(OB_ERR_AI_COLUMN_STRICT_READ,
+                                   static_cast<unsigned long>(table_item->ref_id_),
+                                   static_cast<unsigned long>(column_ref->get_column_id()));
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
   }
   return ret;
 }

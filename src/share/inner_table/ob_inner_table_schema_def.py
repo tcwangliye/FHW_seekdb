@@ -2449,6 +2449,64 @@ all_ai_model_endpoint_def = dict(
 )
 def_table_schema(**all_ai_model_endpoint_def)
 
+all_ai_column_def = dict(
+    owner = 'nijia.nj',
+    table_name = '__all_ai_column',
+    table_id = '1131',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+        ('tenant_id', 'uint'),
+        ('table_id', 'uint'),
+        ('column_id', 'uint')
+    ],
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        ('column_name', 'varchar:OB_MAX_COLUMN_NAME_LENGTH', 'false'),
+        ('state_column_id', 'uint', 'false'),
+        ('request_column_id', 'uint', 'false'),
+        ('result_spec_column_id', 'uint', 'false'),
+        ('expression', 'longtext', 'false'),
+        ('normalized_expr', 'longtext', 'false'),
+        ('dependency_ids', 'longtext', 'false'),
+        ('max_retries', 'int', 'false', '2'),
+        ('definition_version', 'uint', 'false', '1')
+    ]
+)
+def_table_schema(**all_ai_column_def)
+
+all_ai_column_task_def = dict(
+    owner = 'nijia.nj',
+    table_name = '__all_ai_column_task',
+    table_id = '1132',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+        ('tenant_id', 'uint'),
+        ('table_id', 'uint'),
+        ('column_id', 'uint'),
+        ('request_id', 'uint')
+    ],
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        ('definition_version', 'uint', 'false'),
+        ('column_name', 'varchar:OB_MAX_COLUMN_NAME_LENGTH', 'false'),
+        ('rowkey_predicate', 'varchar:4096', 'false'),
+        ('normalized_expr', 'longtext', 'false'),
+        ('max_retries', 'int', 'false'),
+        ('state', 'int', 'false', '1'),
+        ('retry_count', 'int', 'false', '0'),
+        ('eligible_ts', 'datetime:6', 'false', 'CURRENT_TIMESTAMP'),
+        ('owner_token', 'uint', 'false', '0'),
+        ('lease_until', 'datetime:6', 'true'),
+        ('result_sql', 'longtext', 'true'),
+        ('last_error', 'int', 'false', '0')
+    ]
+)
+def_table_schema(**all_ai_column_task_def)
+
 
 all_objauth_mysql_def = dict(
     owner = 'cjl476581',

@@ -1689,6 +1689,7 @@ stmt::StmtType ObResolverUtils::get_stmt_type_by_item_type(const ObItemType item
       SET_STMT_TYPE(T_INSERT);
       SET_STMT_TYPE(T_DELETE);
       SET_STMT_TYPE(T_UPDATE);
+      case T_ALTER_TABLE_RETRY_AI_COLUMN: type = stmt::T_UPDATE; break;
       SET_STMT_TYPE(T_REPLACE);
       // ps
       SET_STMT_TYPE(T_PREPARE);
@@ -1734,6 +1735,7 @@ stmt::StmtType ObResolverUtils::get_stmt_type_by_item_type(const ObItemType item
       // read only
       SET_STMT_TYPE(T_EXPLAIN);
       SET_STMT_TYPE(T_SHOW_COLUMNS);
+      case T_SHOW_AI_COLUMNS: type = stmt::T_SHOW_COLUMNS; break;
       SET_STMT_TYPE(T_SHOW_TABLES);
       SET_STMT_TYPE(T_SHOW_DATABASES);
       SET_STMT_TYPE(T_SHOW_TABLE_STATUS);

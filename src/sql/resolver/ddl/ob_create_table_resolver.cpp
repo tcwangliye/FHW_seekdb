@@ -633,6 +633,7 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
     // Store the column schema after resolve_column_definition in resolved_cols
     // To support generating columns in any order, all column_schema are generated first and then uniformly stored in table_schema
     ObSEArray<ObColumnSchemaV2, SEARRAY_INIT_NUM> resolved_cols;
+    ObSEArray<AiColumnPending, 4> ai_columns;
     // Resolve column names with the runtime name-case mode.
     //RESOLVE_NON_COL needs to add the columns in the query to stats in order to resolve PK constraint information etc.
     if (OB_FAIL(ret)) {
@@ -689,12 +690,16 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
           common::ObString pk_name;
           // ele_pos + 1, points to the next column_schema
           ++ele_pos;
+          AiColumnPending ai_column;
           if (OB_FAIL(resolve_column_definition(column, element, stat,
                                                 is_modify_column_visibility,
                                                 pk_name,
                                                 table_schema,
                                                 false,
-                                                is_create_table_as))) {
+                                                is_create_table_as,
+                                                true,
+                                                &ai_column))) {
+          } else if (ai_column.has_definition_ && OB_FAIL(ai_columns.push_back(ai_column))) {
           } else if (OB_FAIL(check_default_value(column.get_cur_default_value(),
                                           session_info_->get_tz_info_wrap(),
                                           NULL,
@@ -891,6 +896,53 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         } else {
           ObColumnNameHashWrapper name_key(hidden_col.get_column_name_str());
           if (OB_FAIL(column_name_set_.set_refactored(name_key))) {
+          }
+        }
+      }
+    }
+
+    if (OB_SUCC(ret)) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < ai_columns.count(); ++i) {
+        const AiColumnPending &pending = ai_columns.at(i);
+        const ObColumnSchemaV2 *result_column = table_schema.get_column_schema(pending.column_name_);
+        ObString spec;
+        ObSEArray<uint64_t, 8> dependency_ids;
+        if (OB_ISNULL(result_column)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(build_ai_column_spec(table_schema, *result_column, pending,
+                                               result_column->get_column_id(), 1, spec,
+                                               dependency_ids))) {
+        } else {
+          char state_name_buf[64];
+          char request_name_buf[64];
+          char spec_name_buf[64];
+          const int64_t result_id = static_cast<int64_t>(result_column->get_column_id());
+          const int state_len = snprintf(state_name_buf, sizeof(state_name_buf), "__ai_state_%ld", result_id);
+          const int request_len = snprintf(request_name_buf, sizeof(request_name_buf), "__ai_request_%ld", result_id);
+          const int spec_len = snprintf(spec_name_buf, sizeof(spec_name_buf), "__ai_spec_%ld", result_id);
+          if (state_len <= 0 || state_len >= static_cast<int>(sizeof(state_name_buf))
+              || request_len <= 0 || request_len >= static_cast<int>(sizeof(request_name_buf))
+              || spec_len <= 0 || spec_len >= static_cast<int>(sizeof(spec_name_buf))) {
+            ret = OB_SIZE_OVERFLOW;
+          } else {
+            ObColumnSchemaV2 state_column;
+            ObColumnSchemaV2 request_column;
+            ObColumnSchemaV2 spec_column;
+            const ObString state_name(state_len, state_name_buf);
+            const ObString request_name(request_len, request_name_buf);
+            const ObString spec_name(spec_len, spec_name_buf);
+            const ObString pending_value = ObString::make_string("PENDING");
+            const ObString request_expr = ObString::make_string("UUID_SHORT()");
+            if (OB_FAIL(init_ai_hidden_column(state_column, state_name, table_schema.get_table_id(),
+                                             gen_column_id(), ObVarcharType, pending_value, false))) {
+            } else if (OB_FAIL(table_schema.add_column(state_column))) {
+            } else if (OB_FAIL(init_ai_hidden_column(request_column, request_name, table_schema.get_table_id(),
+                                                    gen_column_id(), ObUInt64Type, request_expr, true))) {
+            } else if (OB_FAIL(table_schema.add_column(request_column))) {
+            } else if (OB_FAIL(init_ai_hidden_column(spec_column, spec_name, table_schema.get_table_id(),
+                                                    gen_column_id(), ObVarcharType, spec, false))) {
+            } else if (OB_FAIL(table_schema.add_column(spec_column))) {
+            }
           }
         }
       }

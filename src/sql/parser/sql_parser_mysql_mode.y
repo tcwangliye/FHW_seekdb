@@ -333,7 +333,7 @@ END_P SET_VAR DELIMITER
         QUANTIFIER_TABLE QUARTER QUERY QUEUE_TIME QUICK
 
         RECOVER REDUNDANT REFRESH RELAY RELAYLOG RELAY_LOG_FILE RELAY_LOG_POS RELAY_THREAD RELOAD REMOVE
-        REPEATABLE RESET RESPECT RESTART RESTORE RESUME RETURNED_SQLSTATE RETURNS RETURNING REVERSE
+        REPEATABLE RESET RESPECT RESTART RESTORE RESUME RETRY RETURNED_SQLSTATE RETURNS RETURNING REVERSE
         REWRITE ROLLBACK ROLLUP ROUTINE ROW ROWID ROW_COUNT ROW_FORMAT ROWS RTREE
         RUN RECYCLEBIN REPLICATION ROTATE ROW_NUMBER RUDUNDANT RECURSIVE RANDOM REDO_TRANSPORT_OPTIONS
         RANK READ_ONLY RECOVERY REJECT ROLE
@@ -421,6 +421,7 @@ END_P SET_VAR DELIMITER
 %type <node> opt_equal_mark opt_default_mark read_only_or_write not not2
 %type <node> int_or_decimal
 %type <node> opt_column_attribute_list column_attribute column_attribute_list opt_column_default_value opt_column_default_value_list
+%type <node> ai_column_option_list ai_column_option opt_ai_column_options
 %type <node> show_stmt from_or_in columns_or_fields database_or_schema index_or_indexes_or_keys opt_from_or_in_database_clause opt_show_condition opt_desc_column_option opt_status opt_storage opt_show_engine check_table_options check_table_option
 %type <node> prepare_stmt stmt_name preparable_stmt
 %type <node> variable_set_stmt var_and_val_list var_and_val to_or_eq set_expr_or_default sys_var_and_val
@@ -6241,6 +6242,40 @@ not NULLX
 | INVISIBLE
 {
   malloc_terminal_node($$, result->malloc_pool_, T_INVISIBLE);
+}
+| AI COLUMN '(' expr ')' opt_ai_column_options
+{
+  dup_expr_string($4, result, @4.first_column, @4.last_column);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_DEF, 2, $4, $6);
+}
+;
+
+opt_ai_column_options:
+/* empty */
+{
+  $$ = NULL;
+}
+| WITH '(' ai_column_option_list ')'
+{
+  $$ = $3;
+}
+;
+
+ai_column_option_list:
+ai_column_option
+{
+  $$ = $1;
+}
+| ai_column_option_list ',' ai_column_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+ai_column_option:
+column_name COMP_EQ expr
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_OPTION, 2, $1, $3);
 }
 ;
 
@@ -12730,6 +12765,11 @@ SHOW opt_extended_or_full TABLES opt_from_or_in_database_clause opt_show_conditi
   $$->value_ = $2[0];
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $5, $6, $7);
 }
+| SHOW AI COLUMNS from_or_in relation_factor
+{
+  (void)$4;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_AI_COLUMNS, 1, $5);
+}
 | SHOW TABLE STATUS opt_from_or_in_database_clause opt_show_condition
 { malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_TABLE_STATUS, 2, $4, $5); }
 | SHOW PROCEDURE STATUS opt_from_or_in_database_clause opt_show_condition
@@ -14739,10 +14779,37 @@ relation_factor TO relation_factor
 alter_table_stmt:
 alter_with_opt_hint TABLE relation_factor alter_table_actions
 {
-  ParseNode *table_actions = NULL;
-  merge_nodes(table_actions, result, T_ALTER_TABLE_ACTION_LIST, $4);
-  malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_TABLE, 4, $3, table_actions, NULL, $1);
-  $$->value_ = 0;
+  ParseNode *retry_action = NULL;
+  ParseNode *action_list = $4;
+  int64_t action_count = 0;
+  while (NULL != action_list) {
+    if (T_LINK_NODE == action_list->type_ && 2 == action_list->num_child_) {
+      ParseNode *action = action_list->children_[1];
+      ++action_count;
+      if (OB_NOT_NULL(action) && T_ALTER_TABLE_RETRY_AI_COLUMN == action->type_) {
+        retry_action = action;
+      }
+      action_list = action_list->children_[0];
+    } else {
+      ++action_count;
+      if (T_ALTER_TABLE_RETRY_AI_COLUMN == action_list->type_) {
+        retry_action = action_list;
+      }
+      break;
+    }
+  }
+  if (OB_NOT_NULL(retry_action)) {
+    ParseNode *mixed_actions = NULL;
+    malloc_terminal_node(mixed_actions, result->malloc_pool_, T_INT);
+    mixed_actions->value_ = action_count == 1 ? 0 : 1;
+    malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_TABLE_RETRY_AI_COLUMN, 4,
+                             $3, retry_action->children_[0], retry_action->children_[1], mixed_actions);
+  } else {
+    ParseNode *table_actions = NULL;
+    merge_nodes(table_actions, result, T_ALTER_TABLE_ACTION_LIST, $4);
+    malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_TABLE, 4, $3, table_actions, NULL, $1);
+    $$->value_ = 0;
+  }
 }
 ;
 
@@ -14788,6 +14855,10 @@ opt_set table_option_list_space_seperated
 | alter_column_option
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_COLUMN_OPTION, 1, $1);
+}
+| RETRY AI COLUMN column_name opt_where
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_TABLE_RETRY_AI_COLUMN, 2, $4, $5);
 }
 | RENAME opt_to relation_factor
 {
@@ -18041,6 +18112,7 @@ ACCOUNT
 |       RESET
 |       RESPECT
 |       RESTART
+|       RETRY
 |       RESTORE
 |       RESUME
 |       RETURNED_SQLSTATE
