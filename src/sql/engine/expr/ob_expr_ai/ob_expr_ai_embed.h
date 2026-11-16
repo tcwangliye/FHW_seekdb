@@ -37,11 +37,24 @@ public:
                                 int64_t param_num,
                                 common::ObExprTypeCtx &type_ctx) const override;
   static int eval_ai_embed(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res);
+  // Vectorized entry point: one HTTP request carries the inputs of the whole
+  // batch so that a table scan does not issue one request per row.
+  static int eval_ai_embed_batch(const ObExpr &expr, ObEvalCtx &ctx,
+                                 const ObBitVector &skip, const int64_t batch_size);
   virtual int cg_expr(ObExprCGCtx &expr_cg_ctx, 
                       const ObRawExpr &raw_expr,
                       ObExpr &rt_expr) const override;
   virtual bool need_rt_ctx() const override { return true; }
 private:
+  static int batch_call_embedding(const ObExpr &expr,
+                                  ObEvalCtx &ctx,
+                                  ObIAllocator &allocator,
+                                  const ObString &model_id,
+                                  const int64_t dimension,
+                                  ObArray<ObString> &contents,
+                                  const ObArray<int64_t> &row_idxs,
+                                  ObDatumVector &res_datums,
+                                  ObBitVector &eval_flags);
   static constexpr int MODEL_IDX = 0;
   static constexpr int CONTENT_IDX = 1;
   static constexpr int DIM_IDX = 2;

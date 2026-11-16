@@ -37,7 +37,8 @@ const char *VALID_PROVIDERS[] = {
   "SILICONFLOW",
   "COHERE",
   "HUNYUAN-OPENAI",
-  "OPENAI"
+  "OPENAI",
+  "OLLAMA"
 };
 
 #define EXTRACT_JSON_ELEM_STR(json_key, member) \
@@ -61,6 +62,27 @@ const char *VALID_PROVIDERS[] = {
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_INVALID, elem.first.length(), elem.first.ptr()); \
     LOG_WARN("unknown json key param", K(ret), K(elem.first)); \
   }
+
+// Integer endpoint options are bounded by a documented range. A value outside
+// the range (including an explicit 0) is rejected while parsing so that create
+// and alter report the same diagnostic.
+#define EXTRACT_JSON_ELEM_BOUNDED_INT(json_key, member) \
+      if (elem.first.case_compare(json_key) == 0) { \
+        if (elem.second->json_type() != ObJsonNodeType::J_INT \
+            && elem.second->json_type() != ObJsonNodeType::J_UINT) { \
+          ret = OB_AI_FUNC_PARAM_VALUE_INVALID; \
+          LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, elem.first.length(), elem.first.ptr()); \
+          LOG_WARN("invalid json type for integer param", K(ret), K(elem.first), \
+                   K(elem.second->json_type())); \
+        } else { \
+          member = elem.second->get_int(); \
+          if (member < 1 || member > ObAiModelEndpointInfo::MAX_CONCURRENCY_LIMIT) { \
+            ret = OB_AI_FUNC_PARAM_VALUE_INVALID; \
+            LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, elem.first.length(), elem.first.ptr()); \
+            LOG_WARN("integer param out of range", K(ret), K(elem.first), K(member)); \
+          } \
+        } \
+      } else
 
 int ObAiModelEndpointInfo::parse_from_json_base(common::ObArenaAllocator &allocator, const ObString &name, const ObIJsonBase &params_jbase)
 {
@@ -90,6 +112,8 @@ int ObAiModelEndpointInfo::deep_copy(
   } else if (OB_FAIL(ob_write_string(allocator, other.parameters_, parameters_))) {
   } else if (OB_FAIL(ob_write_string(allocator, other.request_transform_fn_, request_transform_fn_))) {
   } else if (OB_FAIL(ob_write_string(allocator, other.response_transform_fn_, response_transform_fn_))) {
+  } else {
+    max_concurrency_ = other.max_concurrency_;
   }
   return ret;
 }
@@ -112,16 +136,17 @@ int ObAiModelEndpointInfo::check_valid() const
   } else if (url_.empty()) {
     ret = OB_AI_FUNC_PARAM_EMPTY;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_EMPTY, strlen("url"), "url");
-  } else if (access_key_.empty()) {
-    ret = OB_AI_FUNC_PARAM_EMPTY;
-    LOG_USER_ERROR(OB_AI_FUNC_PARAM_EMPTY, strlen("access_key"), "access_key");
-    LOG_WARN("access_key is empty", K(ret), K(*this));
   } else if (provider_.empty()) {
     ret = OB_AI_FUNC_PARAM_EMPTY;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_EMPTY, strlen("provider"), "provider");
   } else if (!is_valid_provider(provider_)) {
     ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("provider"), "provider");
+  } else if (access_key_.empty() && provider_.case_compare("OLLAMA") != 0) {
+    // Ollama endpoints are local services and are addressed without an access key.
+    ret = OB_AI_FUNC_PARAM_EMPTY;
+    LOG_USER_ERROR(OB_AI_FUNC_PARAM_EMPTY, strlen("access_key"), "access_key");
+    LOG_WARN("access_key is empty", K(ret), K(*this));
   } else if (!parameters_.empty()) {
     ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
     LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, strlen("parameters"), "parameters");
@@ -165,6 +190,7 @@ int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &alloca
       EXTRACT_JSON_ELEM_STR("parameters", parameters_)
       EXTRACT_JSON_ELEM_STR("request_transform_fn", request_transform_fn_)
       EXTRACT_JSON_ELEM_STR("response_transform_fn", response_transform_fn_)
+      EXTRACT_JSON_ELEM_BOUNDED_INT("max_concurrency", max_concurrency_)
       EXTRACT_JSON_ELEM_END()
     }
     iter.next();
@@ -184,7 +210,10 @@ int ObAiModelEndpointInfo::merge_delta_endpoint(common::ObArenaAllocator &alloca
 int ObAiModelEndpointInfo::encrypt_access_key_(ObIAllocator &allocator, const ObString &access_key, ObString &encrypted_access_key)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(ob_write_string(allocator, access_key, encrypted_access_key))) {
+  if (access_key.empty()) {
+    // Keyless endpoints (for example Ollama) keep an empty access key.
+    encrypted_access_key.reset();
+  } else if (OB_FAIL(ob_write_string(allocator, access_key, encrypted_access_key))) {
   }
   return ret;
 }
@@ -192,7 +221,9 @@ int ObAiModelEndpointInfo::encrypt_access_key_(ObIAllocator &allocator, const Ob
 int ObAiModelEndpointInfo::decrypt_access_key_(ObIAllocator &allocator, const ObString &encrypted_access_key, ObString &unencrypted_access_key) const
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(ob_write_string(allocator, encrypted_access_key, unencrypted_access_key))) {
+  if (encrypted_access_key.empty()) {
+    unencrypted_access_key.reset();
+  } else if (OB_FAIL(ob_write_string(allocator, encrypted_access_key, unencrypted_access_key))) {
   }
   return ret;
 }
