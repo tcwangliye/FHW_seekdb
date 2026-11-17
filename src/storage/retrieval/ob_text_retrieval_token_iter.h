@@ -119,6 +119,43 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObTextRetrievalTokenIter);
 };
 
+struct BitmapDocId
+{
+  uint64_t high_ = 0;
+  uint64_t low_ = 0;
+  bool operator<(const BitmapDocId &other) const
+  {
+    return high_ < other.high_ || (high_ == other.high_ && low_ < other.low_);
+  }
+  bool operator==(const BitmapDocId &other) const
+  {
+    return high_ == other.high_ && low_ == other.low_;
+  }
+  static uint64_t binary_word(const uint64_t value)
+  {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return __builtin_bswap64(value);
+#else
+    return value;
+#endif
+  }
+  void from_binary(const char *data)
+  {
+    MEMCPY(&high_, data, sizeof(high_));
+    MEMCPY(&low_, data + sizeof(high_), sizeof(low_));
+    high_ = binary_word(high_);
+    low_ = binary_word(low_);
+  }
+  void to_binary(char *data) const
+  {
+    const uint64_t high = binary_word(high_);
+    const uint64_t low = binary_word(low_);
+    MEMCPY(data, &high, sizeof(high));
+    MEMCPY(data + sizeof(high), &low, sizeof(low));
+  }
+  TO_STRING_KV(K_(high), K_(low));
+};
+
 class ObTextRetrievalDaaTTokenIter final : public ObISRDaaTDimIter
 {
 public:
@@ -133,6 +170,8 @@ public:
   virtual int get_curr_score(double &score) const override;
   virtual int get_curr_id(const ObDatum *&id_datum) const override;
 public:
+  // Bitmap consumers use this exclusively instead of the scalar cursor.
+  int get_next_bitmap_ids(BitmapDocId *ids, const int64_t capacity, int64_t &count);
   int get_token_doc_cnt(int64_t &token_doc_cnt) const { return token_iter_->get_token_doc_cnt(token_doc_cnt); }
   virtual int get_dim_max_score(double &score) override {
     int ret = OB_SUCCESS;

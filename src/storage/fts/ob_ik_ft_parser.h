@@ -22,6 +22,7 @@
 #include "storage/fts/dict/ob_ft_dict.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
 #include "storage/fts/ik/ob_ik_processor.h"
+#include "storage/fts/ik/ob_ik_arbitrator.h"
 #include "data_plane/fts/ob_fts_parser.h"
 
 #include <cstdint>
@@ -43,10 +44,9 @@ public:
         segmenters_(allocator_),
         cache_main_(allocator),
         cache_quan_(allocator),
-        cache_stop_(allocator),
         dict_main_(nullptr),
         dict_quan_(nullptr),
-        dict_stop_(nullptr)
+        cs_(nullptr)
   {
   }
 
@@ -58,6 +58,15 @@ public:
                      int64_t &word_len,
                      int64_t &char_cnt,
                      int64_t &word_freq) override;
+
+  // Re-point the parser at the next document while keeping the resolved
+  // dictionaries and the processors alive.
+  int reinit(const ObFTParserParam &param);
+  // Drop per-document state without touching the pinned dictionaries.
+  void finish();
+  // Drop the pinned dictionaries and reuse the allocator in one step.
+  void release();
+  const ObCharsetInfo *charset() const { return cs_; }
 
   VIRTUAL_TO_STRING_KV(K(is_inited_));
 
@@ -101,11 +110,11 @@ private:
   // For now there's no change of dict in one query, so we can pin dict this level.
   ObFTCacheRangeContainer cache_main_;
   ObFTCacheRangeContainer cache_quan_;
-  ObFTCacheRangeContainer cache_stop_;
 
   ObIFTDict *dict_main_;
   ObIFTDict *dict_quan_;
-  ObIFTDict *dict_stop_;
+  const ObCharsetInfo *cs_;
+  ObIKArbitrator arbitrator_;
 
   DISABLE_COPY_ASSIGN(ObIKFTParser);
 };

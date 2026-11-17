@@ -623,6 +623,8 @@ public:
   int64_t get_ret_code() const { return ret_code_; }
   int64_t get_task_id() const { return task_id_; }
   int64_t get_delay_schedule_time() const { return delay_schedule_time_;}
+  int64_t get_task_idle_time_us() const { return task_idle_time_us_; }
+  void set_task_idle_time_us(const int64_t idle_us) { task_idle_time_us_ = idle_us; }
   void set_delay_schedule_time(int64_t delay_schedule_time) { delay_schedule_time_ = delay_schedule_time;}
   ObDDLWaitTransEndCtx* get_wait_trans_ctx() {return &wait_trans_ctx_;}
   ObDDLTaskID get_ddl_task_id() const { return ObDDLTaskID(task_id_); }
@@ -696,6 +698,9 @@ public:
       K_(next_schedule_ts), K_(delay_schedule_time), K(execution_id_), K_(data_format_version),
       K_(dst_schema_version), K_(is_pre_split), K_(is_unique_index), K_(is_global_index), K_(published_schema_version));  static const int64_t MAX_ERR_TOLERANCE_CNT = 3L; // Max torlerance count for error code.
   static const int64_t DEFAULT_TASK_IDLE_TIME_US = 10L * 1000L; // 10ms
+  // Fulltext builds chain several short-lived aux tasks; a 10ms idle between
+  // polls dominates their wall time on small tables.
+  static const int64_t FTS_TASK_IDLE_TIME_US = 1000L; // 1ms
   static const int64_t MAX_IDLE_TIME_US = 30L * 1000L * 1000L; // 30s
 protected:
   int copy_longops_stat(share::ObLongopsValue &value);
@@ -746,6 +751,7 @@ protected:
   share::ObDDLTaskStatInfo stat_info_;
   int64_t delay_schedule_time_;
   int64_t next_schedule_ts_;
+  int64_t task_idle_time_us_;
   int64_t execution_id_; // guarded by lock_
   int64_t start_time_;
   uint64_t data_format_version_;

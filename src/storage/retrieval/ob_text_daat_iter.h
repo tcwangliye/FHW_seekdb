@@ -55,10 +55,15 @@ public:
   ObTextDaaTIter() : ObSRDaaTIterImpl(),
       bm25_param_estimator_(),
       mode_flag_(sql::ObMatchAgainstMode::NATURAL_LANGUAGE_MODE),
-      function_lookup_mode_(false) {}
+      function_lookup_mode_(false),
+      bitmap_cursors_(), bitmap_ids_(), bitmap_results_(), bitmap_heap_(), bitmap_words_(),
+      bitmap_nonempty_words_(0), bitmap_prefix_(0), bitmap_high_(0), bitmap_shift_(0),
+      bitmap_heap_count_(0),
+      bitmap_batch_size_(0), use_bitmap_union_(false), bitmap_initialized_(false) {}
   virtual ~ObTextDaaTIter() { reset(); }
 
   int init(const ObTextDaaTParam &param);
+  virtual int get_next_rows(const int64_t capacity, int64_t &count) override;
   virtual void reuse(const bool switch_tablet = false) override;
   virtual void reset() override;
 protected:
@@ -68,6 +73,45 @@ protected:
   sql::ObMatchAgainstMode mode_flag_;
   bool function_lookup_mode_;
 private:
+  struct PostingCursor
+  {
+    BitmapDocId *ids_ = nullptr;
+    int64_t count_ = 0;
+    int64_t pos_ = 0;
+    TO_STRING_KV(KP_(ids), K_(count), K_(pos));
+  };
+  int init_bitmap_union();
+  int load_bitmap_cursor(const int64_t index);
+  int fill_bitmap_window();
+  int absorb_bitmap_cursor();
+  int take_heap_id(BitmapDocId &id);
+  void reuse_bitmap_union();
+  const BitmapDocId &cursor_id(const int64_t index) const
+  {
+    const PostingCursor &cursor = bitmap_cursors_.at(index);
+    return cursor.ids_[cursor.pos_];
+  }
+  bool in_bitmap_window(const BitmapDocId &id) const
+  {
+    return id.high_ == bitmap_high_
+        && (id.low_ & ~(UINT64_C(4095) << bitmap_shift_)) == bitmap_prefix_;
+  }
+  // An adaptive 4096-bit slice compresses both integer and binary document IDs.
+  // Interleaved keys stay in the heap and merge with the pending bitmap, so the
+  // output retains binary key order even across arbitrary IDs and tablets.
+  ObFixedArray<PostingCursor, ObIAllocator> bitmap_cursors_;
+  ObFixedArray<BitmapDocId, ObIAllocator> bitmap_ids_;
+  ObFixedArray<BitmapDocId, ObIAllocator> bitmap_results_;
+  ObFixedArray<int64_t, ObIAllocator> bitmap_heap_;
+  uint64_t bitmap_words_[64];
+  uint64_t bitmap_nonempty_words_;
+  uint64_t bitmap_prefix_;
+  uint64_t bitmap_high_;
+  uint32_t bitmap_shift_;
+  int64_t bitmap_heap_count_;
+  int64_t bitmap_batch_size_;
+  bool use_bitmap_union_;
+  bool bitmap_initialized_;
   DISALLOW_COPY_AND_ASSIGN(ObTextDaaTIter);
 };
 

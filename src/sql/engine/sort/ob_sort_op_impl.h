@@ -683,6 +683,10 @@ protected:
            && rows_->count() > datum_store_.get_row_cnt();
   }
   int sort_inmem_data();
+  int sort_rows_with_prefix_groups(ObChunkDatumStore::StoredRow **rows, const int64_t count);
+  bool try_radix_sort_binary_key(ObChunkDatumStore::StoredRow **rows,
+      const int64_t count, const int64_t key_index);
+  bool try_hash_sort_prefix_groups(ObChunkDatumStore::StoredRow **rows, const int64_t count);
   int do_dump();
   int inner_dump_part_topn_heap();
 

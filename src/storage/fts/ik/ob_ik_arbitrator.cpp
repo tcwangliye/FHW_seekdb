@@ -112,22 +112,15 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
   int ret = OB_SUCCESS;
 
   int64_t char_len = 0;
+  int64_t chain_position = 0;
   ObIKTokenChain *chain = nullptr;
   for (int64_t current = 0; OB_SUCC(ret) && current < ctx.fulltext_len();) {
     ObFTCharUtil::CharType type;
     // maybe not so good to keep single, check it later
-    if (OB_FAIL(ObCharset::first_valid_char(ctx.collation(),
-                                            ctx.fulltext() + current,
-                                            ctx.fulltext_len() - current,
-                                            char_len))) {
-    } else if (OB_FAIL(ObFTCharUtil::classify_first_char(ctx.collation(),
-                                                         ctx.fulltext() + current,
-                                                         char_len,
-                                                         type))) {
+    if (OB_FAIL(ctx.get_char_at(current, char_len, type))) {
     } else if (ObFTCharUtil::CharType::USELESS == type) {
       current += char_len; // skip useless char
-    } else if (OB_FAIL(chains_.get_refactored(current, chain)) && OB_HASH_NOT_EXIST != ret) {
-    } else if (OB_HASH_NOT_EXIST == ret) {
+    } else if (nullptr == (chain = find_chain(current, chain_position))) {
       ret = OB_SUCCESS;
       if (!keep_single()) {
         // skip single word
@@ -166,10 +159,8 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
         } else {
           // output single word between two token
           while (OB_SUCC(ret) && current < token.offset_) {
-            if (OB_FAIL(ObCharset::first_valid_char(ctx.collation(),
-                                                    ctx.fulltext() + current,
-                                                    ctx.fulltext_len() - current,
-                                                    char_len))) {
+            ObFTCharUtil::CharType gap_type;
+            if (OB_FAIL(ctx.get_char_at(current, char_len, gap_type))) {
               break;
             } else {
               ObIKToken token;
@@ -300,16 +291,41 @@ int ObIKArbitrator::remove_conflict(const ObIKToken &token, ObIKTokenChain *opti
 
 int ObIKArbitrator::prepare(TokenizeContext &ctx)
 {
-  int ret = OB_SUCCESS;
-
-  int cal_bucket_num = MAX(ctx.fulltext_len() / 100, 10);
-  cal_bucket_num = MIN(cal_bucket_num, 100);
-  if (OB_FAIL(chains_.create(cal_bucket_num, ObMemAttr("IK ARBITRATE")))) {
-  }
-  return ret;
+  UNUSED(ctx);
+  chains_.reuse();
+  return OB_SUCCESS;
 }
 
-ObIKArbitrator::ObIKArbitrator() : alloc_(lib::ObMemAttr("IK Arbitrator")) {}
+void ObIKArbitrator::reuse()
+{
+  chains_.reuse();
+  alloc_.reuse();
+}
+
+void ObIKArbitrator::release()
+{
+  chains_.destroy();
+  alloc_.reset();
+}
+
+ObIKArbitrator::ObIKArbitrator()
+  : alloc_(lib::ObMemAttr("IK Arbitrator")),
+    chains_(64 * sizeof(ObIKTokenChain *), ModulePageAllocator(alloc_, "IKChains"))
+{}
+
+ObIKTokenChain *ObIKArbitrator::find_chain(int64_t offset, int64_t &position) const
+{
+  // Result positions normally advance. Retain exact lookup behavior if a
+  // caller revisits an earlier position instead of relying on that property.
+  if (position > 0 && chains_.at(position - 1)->min_offset() >= offset) {
+    position = 0;
+  }
+  while (position < chains_.count() && chains_.at(position)->min_offset() < offset) {
+    ++position;
+  }
+  return position < chains_.count() && chains_.at(position)->min_offset() == offset
+      ? chains_.at(position++) : nullptr;
+}
 
 int ObIKArbitrator::add_chain(ObIKTokenChain *chain)
 {
@@ -318,7 +334,32 @@ int ObIKArbitrator::add_chain(ObIKTokenChain *chain)
     ret = OB_INVALID_ARGUMENT;
   } else if (chain->list().is_empty()) {
     // no need to add empty chain
-  } else if (OB_FAIL(chains_.set_refactored(chain->min_offset(), chain))) {
+  } else {
+    int64_t position = chains_.count();
+    if (position > 0 && chains_.at(position - 1)->min_offset() >= chain->min_offset()) {
+      int64_t left = 0;
+      int64_t right = position;
+      while (left < right) {
+        const int64_t middle = left + (right - left) / 2;
+        if (chains_.at(middle)->min_offset() < chain->min_offset()) {
+          left = middle + 1;
+        } else {
+          right = middle;
+        }
+      }
+      position = left;
+      if (position < chains_.count() && chains_.at(position)->min_offset() == chain->min_offset()) {
+        ret = OB_HASH_EXIST;
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(chains_.push_back(chain))) {
+    } else {
+      for (int64_t i = chains_.count() - 1; i > position; --i) {
+        chains_.at(i) = chains_.at(i - 1);
+      }
+      chains_.at(position) = chain;
+    }
   }
   return ret;
 }

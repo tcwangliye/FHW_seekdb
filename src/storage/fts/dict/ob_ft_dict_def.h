@@ -44,6 +44,37 @@ public:
   ObString get_word() const;
   bool operator==(const ObFTSingleWord &other) const;
 
+  static constexpr uint32_t UNICODE_PAGE_COUNT = 0x1100;
+  static constexpr uint32_t UNICODE_PAGE_WORDS = UNICODE_PAGE_COUNT / 64;
+
+  // Canonical UTF-8 is a one-to-one encoding: direct lookup preserves the
+  // original byte-wise character equality, including embedded NUL characters.
+  static bool decode_utf8(const ObString &value, uint32_t &codepoint)
+  {
+    const uint8_t *s = reinterpret_cast<const uint8_t *>(value.ptr());
+    const int32_t len = value.length();
+    bool valid = false;
+    if (1 == len && s[0] < 0x80) {
+      codepoint = s[0];
+      valid = true;
+    } else if (2 == len && s[0] >= 0xc2 && s[0] <= 0xdf
+               && (s[1] & 0xc0) == 0x80) {
+      codepoint = ((s[0] & 0x1f) << 6) | (s[1] & 0x3f);
+      valid = true;
+    } else if (3 == len && s[0] >= 0xe0 && s[0] <= 0xef
+               && (s[1] & 0xc0) == 0x80 && (s[2] & 0xc0) == 0x80) {
+      codepoint = ((s[0] & 0x0f) << 12) | ((s[1] & 0x3f) << 6) | (s[2] & 0x3f);
+      valid = codepoint >= 0x800 && (codepoint < 0xd800 || codepoint > 0xdfff);
+    } else if (4 == len && s[0] >= 0xf0 && s[0] <= 0xf4
+               && (s[1] & 0xc0) == 0x80 && (s[2] & 0xc0) == 0x80
+               && (s[3] & 0xc0) == 0x80) {
+      codepoint = ((s[0] & 7) << 18) | ((s[1] & 0x3f) << 12)
+          | ((s[2] & 0x3f) << 6) | (s[3] & 0x3f);
+      valid = codepoint >= 0x10000 && codepoint <= 0x10ffff;
+    }
+    return valid;
+  }
+
 public:
   char word[common::ObCharset::MAX_MB_LEN];
   uint8_t word_len;

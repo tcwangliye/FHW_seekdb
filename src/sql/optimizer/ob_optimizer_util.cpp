@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_OPT
 #include "config_bridge.h"
 #include "ob_optimizer_util.h"
+#include "sql/resolver/ddl/ob_explain_stmt.h"
 #include "sql/engine/expr/ob_expr_version.h"
 #include "sql/rewrite/ob_transform_utils.h"
 #include "sql/optimizer/ob_log_table_scan.h"
@@ -6934,6 +6935,44 @@ int ObOptimizerUtil::get_minset_of_exprs(const ObIArray<ObRawExpr *> &src_exprs,
     }
   }
   return ret;
+}
+
+bool ObOptimizerUtil::is_count_only_limited_view(const ObDMLStmt *parent, const ObDMLStmt *child)
+{
+  if (OB_NOT_NULL(parent) && parent->is_explain_stmt()) {
+    parent = static_cast<const ObExplainStmt *>(parent)->get_explain_query_stmt();
+  }
+  if (OB_ISNULL(parent) || OB_ISNULL(child) || !parent->is_select_stmt() || !child->is_select_stmt()) {
+    return false;
+  }
+  const ObSelectStmt *outer = static_cast<const ObSelectStmt *>(parent);
+  const ObSelectStmt *inner = static_cast<const ObSelectStmt *>(child);
+  bool has_assignment = false;
+  if (!outer->is_scala_group_by() || 1 != outer->get_aggr_items().count()
+      || 1 != outer->get_select_item_size() || 1 != outer->get_table_items().count()
+      || 1 != outer->get_from_items().count() || !outer->get_condition_exprs().empty()
+      || !outer->get_having_exprs().empty() || !outer->get_order_items().empty()
+      || outer->has_for_update()
+      || outer->get_select_item(0).expr_ != outer->get_aggr_items().at(0)
+      || T_FUN_COUNT != outer->get_aggr_items().at(0)->get_expr_type()
+      || 0 != outer->get_aggr_items().at(0)->get_param_count()
+      || nullptr == inner->get_limit_expr() || !inner->get_order_items().empty()
+      || inner->has_distinct() || !inner->get_aggr_items().empty()
+      || !inner->get_group_exprs().empty() || !inner->get_having_exprs().empty()
+      || inner->has_window_function() || inner->is_fetch_with_ties()
+      || inner->has_for_update() || inner->has_select_into()
+      || OB_SUCCESS != ObTransformUtils::check_has_assignment(*inner, has_assignment)
+      || has_assignment) {
+    return false;
+  }
+  for (int64_t i = 0; i < inner->get_select_item_size(); ++i) {
+    const ObRawExpr *expr = inner->get_select_item(i).expr_;
+    if (!expr->is_column_ref_expr() && !expr->is_const_expr()) {
+      return false;
+    }
+  }
+  const TableItem *derived = outer->get_table_item(0);
+  return OB_NOT_NULL(derived) && derived->is_generated_table() && derived->ref_query_ == inner;
 }
 
 int ObOptimizerUtil::check_can_encode_sortkey(const common::ObIArray<OrderItem> &order_keys,

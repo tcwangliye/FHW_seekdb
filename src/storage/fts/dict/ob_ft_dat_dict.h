@@ -34,7 +34,8 @@ namespace oceanbase
 namespace storage
 {
 /* @class ObArrayHashMap
- * @description: a fixed size hash map, used to store words and their code.
+ * @description: a fixed-size character-code map: paged Unicode lookup when
+ *               smaller, with byte-wise hashing for other dictionaries.
  */
 class ObArrayHashMap final
 {
@@ -56,11 +57,16 @@ public:
 
   static size_t estimate_capacity(size_t word_num);
 
-  static size_t estimate_size(size_t word_num);
+  static size_t estimate_size(size_t word_num, uint32_t unicode_page_count = 0);
 
-  size_t capacity() const { return header_.capacity_; }
+  size_t capacity() const
+  {
+    return header_.capacity_ != 0 ? header_.capacity_
+        : (header_.buffer_size_ - sizeof(Header)) / sizeof(uint32_t) - ObFTSingleWord::UNICODE_PAGE_COUNT;
+  }
 
-  int init(size_t word_num);
+  int init(size_t word_num, const uint64_t *unicode_pages = nullptr,
+           uint32_t unicode_page_count = 0);
 
   // no duplicate should be inserted
   int insert(const ObString &key, ObFTWordCode code);
@@ -68,6 +74,17 @@ public:
   int find(const ObFTSingleWord &word, ObFTWordCode &code) const;
 
 private:
+  uint32_t read_slot(const uint32_t index) const
+  {
+    uint32_t value = 0;
+    MEMCPY(&value, reinterpret_cast<const char *>(header_.data) + index * sizeof(value), sizeof(value));
+    return value;
+  }
+  void write_slot(const uint32_t index, const uint32_t value)
+  {
+    // The dictionary block is packed; directory entries need not be aligned.
+    MEMCPY(reinterpret_cast<char *>(header_.data) + index * sizeof(value), &value, sizeof(value));
+  }
   struct Header header_;
 } __attribute__((packed));
 

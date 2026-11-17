@@ -382,15 +382,28 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
+  if (ordered_ranges_) {
+    int64_t left = 0;
+    int64_t right = range_dicts_.count();
+    while (left < right) {
+      const int64_t mid = left + (right - left) / 2;
+      // UTF8MB4_BIN uses byte comparison without trimming trailing spaces.
+      if (range_dicts_[mid].end_.get_word().compare(single_word) < 0) {
+        left = mid + 1;
+      } else {
+        right = mid;
+      }
+    }
+    if (left < range_dicts_.count()
+        && range_dicts_[left].start_.get_word().compare(single_word) <= 0) {
+      dict = range_dicts_[left].dict_;
+      return OB_SUCCESS;
+    }
+    return OB_ENTRY_NOT_EXIST;
+  }
+  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.count(); ++i) {
+    if (range_dicts_[i].start_.get_word().compare(single_word) <= 0
+        && range_dicts_[i].end_.get_word().compare(single_word) >= 0) {
       dict = range_dicts_[i].dict_;
       found = true;
     }
@@ -418,7 +431,14 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
       range.start_ = dat->start_word_;
       range.end_ = dat->end_word_;
       range.dict_ = dict;
+      if (ordered_ranges_
+          && (range.start_.get_word().compare(range.end_.get_word()) > 0
+              || (range_dicts_.count() > 0
+                  && range_dicts_[range_dicts_.count() - 1].end_.get_word().compare(range.start_.get_word()) >= 0))) {
+        ordered_ranges_ = false;
+      }
       if (OB_FAIL(range_dicts_.push_back(range))) {
+        OB_DELETEx(ObFTCacheDict, &range_alloc_, dict);
       }
     }
   }

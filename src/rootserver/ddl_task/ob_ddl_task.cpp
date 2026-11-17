@@ -991,7 +991,7 @@ void ObDDLTask::calc_next_schedule_ts(const int ret_code, const int64_t total_ta
     // if delay_schedule_time_ is set 0, means that the task need schedule immediately.
     // that usually happens when task status changed, after that, recover the default delay to awoid spin
     next_schedule_ts_ = max(next_schedule_ts_, ObTimeUtility::current_time() + delay_schedule_time_);
-    delay_schedule_time_ = DEFAULT_TASK_IDLE_TIME_US;
+    delay_schedule_time_ = task_idle_time_us_;
   }
   return;
 }

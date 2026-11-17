@@ -129,8 +129,9 @@ private:
       bool &task_submitted,
       uint64_t &aux_table_id,
       int64_t &task_id);
+  int prepare_aux_tables();
   int prepare_rowkey_doc_table();
-  int prepare_aux_index_tables();
+  int prepare_aux_index_tables(const bool finish_state = true);
   int construct_create_index_arg(
       const ObIndexType index_type,
       obcall::ObCreateIndexArg &arg);

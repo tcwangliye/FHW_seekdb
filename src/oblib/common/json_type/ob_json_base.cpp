@@ -3285,8 +3285,14 @@ int ObIJsonBase::print_array(ObJsonBuffer &j_buf, uint64_t depth, bool is_pretty
         ObIJsonBase *jb_ptr = NULL;
         ObJsonBin j_bin(allocator_);
         jb_ptr = &j_bin;
-        if (OB_FAIL(get_array_element(i, jb_ptr))) {
-        } else if (OB_FAIL(jb_ptr->print(j_buf, true, 0, is_pretty, depth))) {
+        if (is_bin() && i <= INT32_MAX) {
+          // Printing needs a read-only child, not a mutable navigation path.
+          // Reuse the decoded container header via the native value accessor.
+          ret = static_cast<const ObJsonBin *>(this)->get_value(static_cast<int>(i), j_bin);
+        } else {
+          ret = get_array_element(i, jb_ptr);
+        }
+        if (OB_SUCC(ret) && OB_FAIL(jb_ptr->print(j_buf, true, 0, is_pretty, depth))) {
         }
       }
     }
@@ -3334,8 +3340,12 @@ int ObIJsonBase::print_object(ObJsonBuffer &j_buf, uint64_t depth, bool is_prett
           ObIJsonBase *jb_ptr = NULL;
           ObJsonBin j_bin(allocator_);
           jb_ptr = &j_bin;
-          if (OB_FAIL(get_object_value(i, jb_ptr))) {
-          } else if (OB_FAIL(jb_ptr->print(j_buf, true, 0, is_pretty, depth))) {
+          if (is_bin() && i <= INT32_MAX) {
+            ret = static_cast<const ObJsonBin *>(this)->get_value(static_cast<int>(i), j_bin);
+          } else {
+            ret = get_object_value(i, jb_ptr);
+          }
+          if (OB_SUCC(ret) && OB_FAIL(jb_ptr->print(j_buf, true, 0, is_pretty, depth))) {
           }
         }
       }

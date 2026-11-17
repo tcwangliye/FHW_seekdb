@@ -40,6 +40,14 @@ int ObFTWord::hash(uint64_t &hash_val) const
 }
 bool ObFTWord::operator==(const ObFTWord &other) const
 {
+  if (meta_.get_type() == ObVarcharType && meta_ == other.meta_
+      && !word_.is_null() && !other.word_.is_null()
+      && !word_.is_ext() && !other.word_.is_ext()
+      && word_.len_ == other.word_.len_
+      && (word_.len_ == 0 || word_.ptr_ == other.word_.ptr_
+          || 0 == MEMCMP(word_.ptr_, other.word_.ptr_, word_.len_))) {
+    return true;
+  }
   bool is_equal = false;
   int ret = OB_SUCCESS;
   int cmp_ret = 0;

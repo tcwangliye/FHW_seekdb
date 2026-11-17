@@ -40,6 +40,7 @@ public:
 
   int init();
   int reset_resource();
+  int reuse(const char *fulltext, const int64_t fulltext_len, const bool is_smart);
 
   int get_next_token(const char *&word, int64_t &word_len, int64_t &offset, int64_t &char_cnt);
 
@@ -47,6 +48,7 @@ public:
 
   int current_char(const char *&ch, uint8_t &char_len);
   int current_char_type(ObFTCharUtil::CharType &type);
+  int get_char_at(int64_t offset, int64_t &length, ObFTCharUtil::CharType &type) const;
 
   int step_next();
 
@@ -77,6 +79,7 @@ private:
   int prepare_next_char();
 
   ObCollationType coll_type_;
+  bool is_utf8_;
   const char *fulltext_;
   int64_t fulltext_len_;
 

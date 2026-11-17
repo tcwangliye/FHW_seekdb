@@ -179,7 +179,9 @@ int ObTransformPreProcess::transform_one_stmt(common::ObIArray<ObParentDMLStmt> 
     }
     if (OB_SUCC(ret)) {
       if (stmt->get_match_exprs().count() > 0 &&
-          OB_FAIL(preserve_order_for_fulltext_search(stmt, is_happened))) {
+          OB_FAIL(preserve_order_for_fulltext_search(stmt,
+              parent_stmts.empty() ? nullptr : parent_stmts.at(parent_stmts.count() - 1).stmt_,
+              is_happened))) {
       } else {
         trans_happened |= is_happened;
       }
@@ -3790,7 +3792,8 @@ int ObTransformPreProcess::do_flatten_conditions(ObDMLStmt *stmt, ObIArray<ObRaw
 
 // full-text index queries on a single base table are processed with order preservation. 
 // (Order is not preserved in multi-table join scenarios.)
-int ObTransformPreProcess::preserve_order_for_fulltext_search(ObDMLStmt *stmt, bool& trans_happened)
+int ObTransformPreProcess::preserve_order_for_fulltext_search(
+    ObDMLStmt *stmt, const ObDMLStmt *parent_stmt, bool& trans_happened)
 {
   int ret = OB_SUCCESS;
   trans_happened = false;
@@ -3798,6 +3801,27 @@ int ObTransformPreProcess::preserve_order_for_fulltext_search(ObDMLStmt *stmt, b
   ObRawExpr *match_expr = nullptr;
   if (OB_ISNULL(stmt)) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (ObOptimizerUtil::is_count_only_limited_view(parent_stmt, stmt)
+      && stmt->get_match_exprs().count() == 1
+      && !stmt->get_match_exprs().at(0)->is_es_match()
+      && ObMatchAgainstMode::NATURAL_LANGUAGE_MODE == stmt->get_match_exprs().at(0)->get_mode_flag()) {
+    // The parent observes only the limited row count, including any offset.
+    // Neither the selected column values nor implicit ranking are observable.
+    // Replacing unused columns also avoids an unnecessary document lookup.
+    ObSelectStmt *select_stmt = static_cast<ObSelectStmt *>(stmt);
+    ObConstRawExpr *one_expr = nullptr;
+    for (int64_t i = 0; OB_SUCC(ret) && i < select_stmt->get_select_item_size(); ++i) {
+      SelectItem &item = select_stmt->get_select_item(i);
+      if (item.expr_->is_column_ref_expr()) {
+        if (nullptr == one_expr && OB_FAIL(ObRawExprUtils::build_const_int_expr(
+            *ctx_->expr_factory_, ObIntType, 1, one_expr))) {
+        } else {
+          item.expr_ = one_expr;
+          trans_happened = true;
+        }
+      }
+    }
+    OPT_TRACE("outer COUNT does not observe fulltext ordering or column values");
   } else if (stmt->get_table_items().count() != 1 || stmt->get_order_item_size() != 0) {
     // do nothing
   } else if (stmt->is_select_stmt() && 

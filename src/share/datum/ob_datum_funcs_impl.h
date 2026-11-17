@@ -171,6 +171,11 @@ struct ObNullSafeDatumStrCmp
       cmp_ret = NULL_FIRST ? -1 : 1;
     } else if (OB_UNLIKELY(r.is_null())) {
       cmp_ret = NULL_FIRST ? 1 : -1;
+    } else if (CS_TYPE != CS_TYPE_BINARY && l.len_ == r.len_
+               && (0 == l.len_ || l.ptr_ == r.ptr_ || 0 == MEMCMP(l.ptr_, r.ptr_, l.len_))) {
+      // Identical bytes compare equal under the same collation and padding rule.
+      // Keep binary keys on their existing byte-comparison path.
+      cmp_ret = 0;
     } else {
       ret = datum_cmp::ObDatumStrCmp<CS_TYPE, WITH_END_SPACE>::cmp(l, r, cmp_ret);
     }

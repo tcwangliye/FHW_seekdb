@@ -18,12 +18,25 @@
 
 #include "storage/fts/dict/ob_ft_cache.h"
 
+#include <atomic>
+
 #include "lib/oblog/ob_log_module.h"
 
 namespace oceanbase
 {
 namespace storage
 {
+static std::atomic<uint64_t> &dictionary_generation()
+{
+  static std::atomic<uint64_t> generation(0);
+  return generation;
+}
+
+uint64_t ObDictCache::get_dict_generation()
+{
+  return dictionary_generation().load(std::memory_order_acquire);
+}
+
 int ObDictCache::get_dict(const ObDictCacheKey &key,
                           const ObDictCacheValue *&value,
                           common::ObKVCacheHandle &handle)
@@ -46,6 +59,8 @@ int ObDictCache::put_and_fetch_dict(const ObDictCacheKey &key,
   int ret = OB_SUCCESS;
   handle.reset();
   if (OB_FAIL(put_and_fetch(key, value, pvalue, handle))) {
+  } else {
+    dictionary_generation().fetch_add(1);
   }
   return ret;
 }

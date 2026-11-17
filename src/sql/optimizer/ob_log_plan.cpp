@@ -12039,12 +12039,41 @@ int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_mat
     ObTextRetrievalInfo &tr_info = table_scan->get_text_retrieval_info();
     tr_info.match_expr_ = match_against;
     tr_info.pushdown_match_filter_ = match_pred;
+    if (NATURAL_LANGUAGE_MODE == match_against->get_mode_flag()
+        && T_OP_BOOL == match_pred->get_expr_type()
+        && 1 == match_pred->get_param_count()
+        && match_pred->get_param_expr(0) == match_against
+        && ((get_stmt()->is_select_stmt()
+             && static_cast<const ObSelectStmt *>(get_stmt())->is_scala_group_by())
+            || ObOptimizerUtil::is_count_only_limited_view(
+                   get_optimizer_context().get_root_stmt(), get_stmt()))) {
+      // A count-only retrieval consumes neither the implicit relevance order nor
+      // the scores, so the relevance column and the boolean filter on it are dead
+      // work for the whole scan.
+      ObSEArray<ObRawExpr *, 16> relation_exprs;
+      bool score_is_used = false;
+      if (OB_FAIL(get_stmt()->get_relation_exprs(relation_exprs))) {
+      } else {
+        for (int64_t i = 0; !score_is_used && i < relation_exprs.count(); ++i) {
+          const ObRawExpr *expr = relation_exprs.at(i);
+          score_is_used = expr != match_pred
+              && (expr == match_against || expr->has_flag(CNT_MATCH_EXPR));
+        }
+        // A lookup pipeline keeps its score bookkeeping; only the covering
+        // retrieval can drop it.
+        if (OB_SUCC(ret) && !score_is_used && !table_scan->get_index_back()) {
+          tr_info.pushdown_match_filter_ = nullptr;
+          tr_info.need_calc_relevance_ = false;
+        }
+      }
+    }
     // The mapping table is absent when the data-table rowkey is used as the document ID.
     table_scan->set_doc_id_index_table_id(tr_info.doc_id_idx_tid_);
     if (table_scan->is_vec_adaptive_scan() || table_scan->is_vec_idx_scan_post_filter()) {
       table_scan->set_rowkey_doc_table_id(tr_info.rowkey_idx_tid_);
     }
-    if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.doc_id_idx_tid_ == OB_INVALID_ID))) {
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.doc_id_idx_tid_ == OB_INVALID_ID))) {
     } else if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.rowkey_idx_tid_ == OB_INVALID_ID))) {
     }
   }

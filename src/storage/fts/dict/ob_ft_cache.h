@@ -133,6 +133,10 @@ public:
                          const ObDictCacheValue *&pvalue,
                          common::ObKVCacheHandle &handle);
 
+  // Bumped when new dictionary content is published, so that views pinned by
+  // long-lived parsers can be dropped.
+  static uint64_t get_dict_generation();
+
 public:
   static ObDictCache &get_instance()
   {

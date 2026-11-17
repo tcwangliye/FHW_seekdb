@@ -370,6 +370,12 @@ int ObIndexBuildTask::init(
     } else {
       
       dst_schema_version_ = schema_version_;
+      if (share::schema::is_doc_rowkey_aux(create_index_arg_.index_type_)
+          || share::schema::is_rowkey_doc_aux(create_index_arg_.index_type_)
+          || share::schema::is_fts_index_aux(create_index_arg_.index_type_)
+          || share::schema::is_fts_doc_word_aux(create_index_arg_.index_type_)) {
+        set_task_idle_time_us(FTS_TASK_IDLE_TIME_US);
+      }
       is_inited_ = true;
     }
 
@@ -418,6 +424,12 @@ int ObIndexBuildTask::init(const ObDDLTaskRecord &task_record)
 
 
     dst_schema_version_ = schema_version_;
+    if (share::schema::is_doc_rowkey_aux(create_index_arg_.index_type_)
+        || share::schema::is_rowkey_doc_aux(create_index_arg_.index_type_)
+        || share::schema::is_fts_index_aux(create_index_arg_.index_type_)
+        || share::schema::is_fts_doc_word_aux(create_index_arg_.index_type_)) {
+      set_task_idle_time_us(FTS_TASK_IDLE_TIME_US);
+    }
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(init_ddl_task_monitor_info(index_table_id))) {
     } else {

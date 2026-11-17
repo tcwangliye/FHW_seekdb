@@ -98,7 +98,7 @@ class ObFTTrie final
 public:
   ObFTTrie(ObIAllocator &allocator, ObCollationType collation_type)
       : allocator_(allocator), collation_type_(collation_type), root_(allocator), node_num_(0),
-        level_statistics_()
+        level_statistics_(), unicode_pages_(), unicode_page_count_(0), unicode_pages_valid_(true)
   {
   }
 
@@ -107,6 +107,8 @@ public:
   ObFTTrieNode<DATA_TYPE> *root() { return &root_; }
 
   size_t node_num() const { return node_num_; }
+  uint32_t unicode_page_count() const { return unicode_pages_valid_ ? unicode_page_count_ : 0; }
+  const uint64_t *unicode_pages() const { return unicode_pages_; }
 
   int get_start_word(ObFTSingleWord &start_word) const
   {
@@ -137,6 +139,9 @@ private:
 
   size_t node_num_;
   uint32_t level_statistics_[64];
+  uint64_t unicode_pages_[ObFTSingleWord::UNICODE_PAGE_WORDS];
+  uint32_t unicode_page_count_;
+  bool unicode_pages_valid_;
 };
 
 extern template class ObFTTrie<void>;

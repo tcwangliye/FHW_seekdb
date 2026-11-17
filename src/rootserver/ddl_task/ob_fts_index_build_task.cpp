@@ -158,6 +158,7 @@ int ObFtsIndexBuildTask::init(
     } else {
       
       dst_schema_version_ = schema_version_;
+      set_task_idle_time_us(FTS_TASK_IDLE_TIME_US);
       is_inited_ = true;
     }
   }
@@ -200,6 +201,7 @@ int ObFtsIndexBuildTask::init(const ObDDLTaskRecord &task_record)
     start_time_ = ObTimeUtility::current_time();
     
     dst_schema_version_ = schema_version_;
+    set_task_idle_time_us(FTS_TASK_IDLE_TIME_US);
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(init_ddl_task_monitor_info(index_table_id))) {
     } else {
@@ -230,7 +232,12 @@ int ObFtsIndexBuildTask::process()
       break;
     }
     case ObDDLTaskStatus::GENERATE_ROWKEY_DOC_SCHEMA: {
-      if (OB_FAIL(prepare_rowkey_doc_table())) {
+      // An offline rebuild keeps the sequential generation: the redefinition
+      // task owns the new table and expects each auxiliary table's complement to
+      // complete before the next one is created.
+      const int second_ret = create_index_arg_.is_offline_rebuild_
+          ? prepare_rowkey_doc_table() : prepare_aux_tables();
+      if (OB_FAIL(second_ret)) {
       }
       break;
     }
@@ -361,11 +368,22 @@ int ObFtsIndexBuildTask::get_next_status(share::ObDDLTaskStatus &next_status)
     const ObDDLTaskStatus status = static_cast<ObDDLTaskStatus>(task_status_);
     switch (status) {
       case ObDDLTaskStatus::PREPARE: {
-        next_status = ObDDLTaskStatus::GENERATE_ROWKEY_DOC_SCHEMA;
+        bool need_to_load_dic = false;
+        const ObString &parser_name = create_index_arg_.index_option_.parser_name_;
+        if (create_index_arg_.is_offline_rebuild_) {
+          next_status = ObDDLTaskStatus::GENERATE_ROWKEY_DOC_SCHEMA;
+        } else if (is_fts_task() && OB_FAIL(ObFtsIndexBuilderUtil::check_need_to_load_dic(parser_name, need_to_load_dic))) {
+        } else if (need_to_load_dic) {
+          next_status = ObDDLTaskStatus::LOAD_DICTIONARY;
+        } else {
+          next_status = ObDDLTaskStatus::GENERATE_ROWKEY_DOC_SCHEMA;
+        }
         break;
       }
       case ObDDLTaskStatus::GENERATE_ROWKEY_DOC_SCHEMA: {
-        next_status = ObDDLTaskStatus::WAIT_ROWKEY_DOC_TABLE_COMPLEMENT;
+        next_status = create_index_arg_.is_offline_rebuild_
+            ? ObDDLTaskStatus::WAIT_ROWKEY_DOC_TABLE_COMPLEMENT
+            : ObDDLTaskStatus::WAIT_AUX_TABLE_COMPLEMENT;
         break;
       }
       case ObDDLTaskStatus::WAIT_ROWKEY_DOC_TABLE_COMPLEMENT: {
@@ -380,7 +398,9 @@ int ObFtsIndexBuildTask::get_next_status(share::ObDDLTaskStatus &next_status)
         break;
       }
       case ObDDLTaskStatus::LOAD_DICTIONARY: {
-        next_status = ObDDLTaskStatus::GENERATE_DOC_AUX_SCHEMA;
+        next_status = create_index_arg_.is_offline_rebuild_
+            ? ObDDLTaskStatus::GENERATE_DOC_AUX_SCHEMA
+            : ObDDLTaskStatus::GENERATE_ROWKEY_DOC_SCHEMA;
         break;
       }
       case ObDDLTaskStatus::GENERATE_DOC_AUX_SCHEMA: {
@@ -498,7 +518,43 @@ int ObFtsIndexBuildTask::prepare_aux_table(
   return ret;
 }
 
+// Create every auxiliary table in one round. The four child builds read the
+// same data-table snapshot and none of them reads another auxiliary table's
+// data, so a single generation round and a single complement wait replace the
+// two sequential rounds that dominated small builds.
 int ObFtsIndexBuildTask::prepare_rowkey_doc_table()
+{
+  int ret = OB_SUCCESS;
+  bool state_finished = false;
+  const ObIndexType index_type = ObIndexType::INDEX_TYPE_ROWKEY_DOC_ID_LOCAL;
+  ObDDLTaskStatus next_status = static_cast<ObDDLTaskStatus>(task_status_);
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else if (ObDDLTaskStatus::GENERATE_ROWKEY_DOC_SCHEMA != task_status_) {
+    ret = OB_STATE_NOT_MATCH;
+  } else if (use_doc_id_ && OB_FAIL(prepare_aux_table(index_type,
+                                       rowkey_doc_task_submitted_,
+                                       rowkey_doc_aux_table_id_,
+                                       rowkey_doc_task_id_))) {
+  } else if (!use_doc_id_) {
+    rowkey_doc_task_submitted_ = true;
+  }
+  if (OB_SUCC(ret) && rowkey_doc_task_submitted_) {
+    state_finished = true;
+  }
+  if (state_finished || OB_FAIL(ret)) {
+    if (OB_FAIL(ret)) {
+      next_status = ObIDDLTask::in_ddl_retry_white_list(ret) ? next_status : ObDDLTaskStatus::FAIL;
+    } else if (OB_FAIL(get_next_status(next_status))) {
+      next_status = ObDDLTaskStatus::FAIL;
+    }
+    (void)switch_status(next_status, next_status != ObDDLTaskStatus::FAIL, ret);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+int ObFtsIndexBuildTask::prepare_aux_tables()
 {
   int ret = OB_SUCCESS;
   bool state_finished = false;
@@ -515,7 +571,9 @@ int ObFtsIndexBuildTask::prepare_rowkey_doc_table()
   } else if (!use_doc_id_) {
     rowkey_doc_task_submitted_ = true;
   }
-  if (OB_SUCC(ret) && rowkey_doc_task_submitted_) {
+  if (OB_SUCC(ret) && OB_FAIL(prepare_aux_index_tables(false /* finish_state */))) {
+  } else if (OB_SUCC(ret) && rowkey_doc_task_submitted_ && doc_rowkey_task_submitted_
+             && domain_index_aux_task_submitted_ && fts_doc_word_task_submitted_) {
     state_finished = true;
   }
   if (state_finished || OB_FAIL(ret)) {
@@ -533,7 +591,7 @@ int ObFtsIndexBuildTask::prepare_rowkey_doc_table()
   return ret;
 }
 
-int ObFtsIndexBuildTask::prepare_aux_index_tables()
+int ObFtsIndexBuildTask::prepare_aux_index_tables(const bool finish_state)
 {
   int ret = OB_SUCCESS;
   bool state_finished = false;
@@ -549,7 +607,8 @@ int ObFtsIndexBuildTask::prepare_aux_index_tables()
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
   } else if (OB_FAIL(get_next_status(next_status))) {
-  } else if (ObDDLTaskStatus::GENERATE_DOC_AUX_SCHEMA != task_status_) {
+  } else if (ObDDLTaskStatus::GENERATE_DOC_AUX_SCHEMA != task_status_
+             && ObDDLTaskStatus::GENERATE_ROWKEY_DOC_SCHEMA != task_status_) {
     ret = OB_STATE_NOT_MATCH;
   } else if (is_fts_task() && OB_FAIL(ObFtsIndexBuilderUtil::check_need_to_load_dic(parser_name, need_to_load_dic))) {
   } else if (need_to_load_dic) {
@@ -635,7 +694,7 @@ int ObFtsIndexBuildTask::prepare_aux_index_tables()
   if (OB_SUCC(ret) && doc_rowkey_task_submitted_ && domain_index_aux_task_submitted_ && fts_doc_word_task_submitted_) {
     state_finished = true;
   }
-  if (state_finished || OB_FAIL(ret)) {
+  if (finish_state && (state_finished || OB_FAIL(ret))) {
     (void)switch_status(next_status, true, ret);
     LOG_INFO("generate schema finished", K(ret), K(parent_task_id_), K(task_id_), K(*this));
   }

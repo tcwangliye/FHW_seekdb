@@ -27,6 +27,109 @@ namespace oceanbase
 namespace storage
 {
 
+namespace
+{
+// The built-in list is immutable. ASCII UTF-8 words have the same folded
+// letter weights under its general_ci collation; other inputs use that
+// collation's full implementation below.
+struct AsciiStopwordIndex
+{
+  static constexpr uint64_t SIZE = 512;
+  static constexpr int64_t MAX_LEN = 32;
+  struct Entry
+  {
+    uint64_t hash_;
+    const char *word_;
+    uint8_t len_;
+  };
+  Entry entries_[SIZE] = {};
+  bool compatible_ = true;
+
+  static uint64_t hash_word(const char *value, const int64_t length)
+  {
+    uint64_t hash = 1469598103934665603ULL;
+    for (int64_t i = 0; i < length; ++i) {
+      hash ^= static_cast<unsigned char>(value[i]) | 0x20;
+      hash *= 1099511628211ULL;
+    }
+    return hash;
+  }
+
+  static bool same_letters(const char *left, const char *right, const int64_t length)
+  {
+    bool same = true;
+    for (int64_t i = 0; same && i < length; ++i) {
+      same = (static_cast<unsigned char>(left[i]) | 0x20)
+          == (static_cast<unsigned char>(right[i]) | 0x20);
+    }
+    return same;
+  }
+
+  static constexpr uint64_t bucket(const uint64_t hash)
+  {
+    return (hash * 11400714819323198485ULL) >> 55;
+  }
+
+  AsciiStopwordIndex()
+  {
+    for (const auto &word : ob_stop_word_list) {
+      int64_t length = 0;
+      for (; word[length] != '\0'; ++length) {
+        const unsigned char ch = static_cast<unsigned char>(word[length]) | 0x20;
+        if (ch < 'a' || ch > 'z' || length >= MAX_LEN) {
+          compatible_ = false;
+          break;
+        }
+      }
+      if (compatible_ && length > 0) {
+        const uint64_t hash = hash_word(word, length);
+        uint64_t pos = bucket(hash);
+        while (entries_[pos].len_ != 0 && entries_[pos].hash_ != hash) {
+          pos = (pos + 1) & (SIZE - 1);
+        }
+        entries_[pos].hash_ = hash;
+        entries_[pos].word_ = word;
+        entries_[pos].len_ = static_cast<uint8_t>(length);
+      }
+    }
+  }
+
+  // Handles pure ASCII words of any length, so long words no longer fall back
+  // to a temporary allocator plus charset conversion for a hash lookup.
+  bool check(const ObFTWord &word, bool &found) const
+  {
+    bool handled = compatible_
+        && ObCharset::charset_type_by_coll(word.get_collation_type()) == CHARSET_UTF8MB4;
+    if (handled) {
+      const ObString value = word.get_word().get_string();
+      handled = value.length() > 0 && value.length() <= MAX_LEN;
+      for (int64_t i = 0; handled && i < value.length(); ++i) {
+        const unsigned char ch = static_cast<unsigned char>(value.ptr()[i]) | 0x20;
+        if (ch < 'a' || ch > 'z') {
+          handled = false;
+        }
+      }
+      if (handled) {
+        const uint64_t hash = hash_word(value.ptr(), value.length());
+        uint64_t pos = bucket(hash);
+        found = false;
+        while (entries_[pos].len_ != 0) {
+          if (entries_[pos].hash_ == hash
+              && entries_[pos].len_ == value.length()
+              && same_letters(entries_[pos].word_, value.ptr(), value.length())) {
+            found = true;
+            break;
+          }
+          pos = (pos + 1) & (SIZE - 1);
+        }
+      }
+    }
+    return handled;
+  }
+};
+const AsciiStopwordIndex ascii_stopwords;
+} // namespace
+
 ////////////////////////////////////////////////////////////////////////////////
 // class ObStopWordChecker
 ObStopWordChecker::~ObStopWordChecker()
@@ -76,12 +179,13 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
   int ret = OB_SUCCESS;
   
   
-  common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (ascii_stopwords.check(word, is_stopword)) {
   } else {
+    common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
     common::ObString cmp_str;
     // do nothing set out with in if type is the same.
     if (OB_FAIL(common::ObCharset::charset_convert(
@@ -115,7 +219,9 @@ ObAddWord::ObAddWord(
     const ObObjMeta &meta,
     const ObAddWordFlag &flag,
     common::ObIAllocator &allocator,
-    ObFTWordMap &word_map)
+    ObFTWordMap &word_map,
+    const char *fulltext,
+    int64_t fulltext_len)
   : word_meta_(meta),
     allocator_(allocator),
     word_map_(word_map),
@@ -124,7 +230,12 @@ ObAddWord::ObAddWord(
     stopword_cnt_(0),
     min_token_size_(property.min_token_size_),
     max_token_size_(property.max_token_size_),
-    flag_(flag)
+    flag_(flag),
+    fulltext_(fulltext),
+    fulltext_len_(fulltext_len),
+    shared_fulltext_(nullptr),
+    can_share_fulltext_(nullptr != fulltext && fulltext_len > 0
+        && ObCharset::charset_type_by_coll(meta.get_collation_type()) == CHARSET_UTF8MB4)
 {
 }
 
@@ -158,11 +269,55 @@ bool ObAddWord::is_min_max_word(const int64_t c_len) const
   return flag_.min_max_word() && (c_len < min_token_size_ || c_len > max_token_size_);
 }
 
+bool ObAddWord::can_share_unchanged_word(const ObFTWord &word) const
+{
+  if (!can_share_fulltext_) {
+    return false;
+  }
+  const ObString value = word.get_word().get_string();
+  const uintptr_t begin = reinterpret_cast<uintptr_t>(fulltext_);
+  const uintptr_t address = reinterpret_cast<uintptr_t>(value.ptr());
+  if (address < begin || address - begin > static_cast<uint64_t>(fulltext_len_)
+      || value.length() > fulltext_len_ - static_cast<int64_t>(address - begin)) {
+    return false;
+  }
+  const unsigned char *bytes = reinterpret_cast<const unsigned char *>(value.ptr());
+  for (int64_t i = 0; i < value.length();) {
+    const unsigned char ch = bytes[i];
+    if (ch < 0x80 && !(ch >= 'A' && ch <= 'Z')) {
+      ++i;
+    } else if (ch >= 0xE4 && ch <= 0xE9 && i + 2 < value.length()
+        && (bytes[i + 1] & 0xC0) == 0x80 && (bytes[i + 2] & 0xC0) == 0x80
+        && (ch != 0xE4 || bytes[i + 1] >= 0xB8)) {
+      // U+4E00..U+9FFF have no lowercase mapping.
+      i += 3;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
 int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (flag_.casedown() && can_share_unchanged_word(src)) {
+    // Own one bounded copy of a small document. Token pointers must remain
+    // valid after segment() returns, including when the input is a LOB view.
+    if (nullptr == shared_fulltext_) {
+      ObString owned;
+      if (OB_FAIL(ob_write_string(allocator_, ObString(fulltext_len_, fulltext_), owned))) {
+      } else {
+        shared_fulltext_ = owned.ptr();
+      }
+    }
+    if (OB_SUCC(ret)) {
+      const int64_t offset = reinterpret_cast<uintptr_t>(src.get_word().ptr_)
+          - reinterpret_cast<uintptr_t>(fulltext_);
+      dst = ObFTWord(src.get_word().len_, shared_fulltext_ + offset, word_meta_);
+    }
   } else if (flag_.casedown()) {
     ObString dst_str;
     if (OB_FAIL(ObCharset::tolower(
@@ -198,20 +353,16 @@ int ObAddWord::check_stopword(const ObFTWord &ft_word, bool &is_stopword)
 int ObAddWord::groupby_word(const ObFTWord &word, const int64_t word_freq)
 {
   int ret = OB_SUCCESS;
-  int64_t word_count = 0;
   if (OB_UNLIKELY(word.empty() || word_freq <= 0)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (!flag_.groupby_word()) {
     if (OB_FAIL(word_map_.set_refactored(word, 1/*word count*/))) {
     }
-  } else if (OB_FAIL(word_map_.get_refactored(word, word_count)) && OB_HASH_NOT_EXIST != ret) {
   } else {
-    if (OB_HASH_NOT_EXIST == ret) {
-      word_count = 1;
-    } else {
-      word_count += word_freq;
-    }
-    if (OB_FAIL(word_map_.set_refactored(word, word_count, 1/*overwrite*/))) {
+    auto add_frequency = [word_freq](auto &entry) {
+      entry.second += word_freq;
+    };
+    if (OB_FAIL(word_map_.set_or_update(word, 1/*word count*/, add_frequency))) {
     }
   }
   return ret;

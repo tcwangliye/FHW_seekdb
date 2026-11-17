@@ -63,6 +63,19 @@ int ObFTTrie<DATA_TYPE>::insert(const ObString &words, const ObFTTrieNodeData<DA
             } else {
               node_ptr = new_child;
               node_num_++;
+              if (unicode_pages_valid_) {
+                uint32_t codepoint = 0;
+                if (!ObFTSingleWord::decode_utf8(current_char, codepoint)) {
+                  unicode_pages_valid_ = false;
+                } else {
+                  const uint32_t page = codepoint >> 8;
+                  const uint64_t mask = UINT64_C(1) << (page & 63);
+                  if (0 == (unicode_pages_[page >> 6] & mask)) {
+                    unicode_pages_[page >> 6] |= mask;
+                    ++unicode_page_count_;
+                  }
+                }
+              }
             }
           }
         }

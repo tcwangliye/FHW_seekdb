@@ -592,6 +592,32 @@ int ObStaticEngineCG::generate_spec_basic(ObLogicalOperator &op,
     OZ(generate_rt_exprs(op.get_filter_exprs(), spec.filters_));
   }
   OZ(generate_rt_exprs(op.get_output_exprs(), spec.output_));
+  if (OB_SUCC(ret) && (PHY_TABLE_SCAN == spec.type_ || IS_SAMPLE_SCAN(spec.type_))) {
+    ObTableScanSpec &tsc_spec = static_cast<ObTableScanSpec &>(spec);
+    if (tsc_spec.is_fts_ddl_) {
+      // The outputs are now available. Keep scalar execution for residual
+      // filters and generated columns without batch result frames.
+      bool batch_fts = spec.filters_.empty() && spec.output_.count() >= 4;
+      int64_t word_idx = -1;
+      for (int64_t i = 0; batch_fts && i < spec.output_.count(); ++i) {
+        if (T_FUN_SYS_WORD_SEGMENT == spec.output_.at(i)->type_) {
+          word_idx = i;
+        }
+      }
+      const int64_t doc_idx = tsc_spec.is_fts_index_aux_ ? word_idx + 1 : word_idx - 1;
+      batch_fts = batch_fts && word_idx >= 0 && doc_idx >= 0 && doc_idx < spec.output_.count();
+      for (int64_t i = 0; batch_fts && i < spec.output_.count(); ++i) {
+        const ObExpr *expr = spec.output_.at(i);
+        if (i == doc_idx || T_FUN_SYS_WORD_SEGMENT == expr->type_
+            || T_FUN_SYS_WORD_COUNT == expr->type_ || T_FUN_SYS_DOC_LENGTH == expr->type_) {
+          batch_fts = expr->is_batch_result();
+        }
+      }
+      if (!batch_fts) {
+        spec.max_batch_size_ = 0;
+      }
+    }
+  }
   if (OB_SUCC(ret)) {
     if (OB_FAIL(check_exprs_columnlized(op))) {
     }
@@ -3681,7 +3707,7 @@ int ObStaticEngineCG::generate_normal_tsc(ObLogTableScan &op, ObTableScanSpec &s
       } else if (ddl_table_schema->is_fts_index_aux() || ddl_table_schema->is_fts_doc_word_aux()) {
         spec.is_fts_ddl_ = true;
         spec.is_fts_index_aux_ = ddl_table_schema->is_fts_index_aux();
-        spec.max_batch_size_ = 0; // TODO: @jinzhu, remove me later after support post-building fts index vectorization.
+        // Batch eligibility is checked after generating the output expressions.
         if (OB_UNLIKELY(ddl_table_schema->get_parser_name_str().empty())) {
           ret = OB_ERR_UNEXPECTED;
         } else {

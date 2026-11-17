@@ -414,6 +414,7 @@ class ObJsonBin : public ObIJsonBase
 {
 public:
   friend class ObJsonBinSerializer;
+  friend class ObIJsonBase;
   ObJsonBin()
       : ObIJsonBase(nullptr),
         allocator_(nullptr),

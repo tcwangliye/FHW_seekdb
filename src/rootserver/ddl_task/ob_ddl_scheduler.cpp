@@ -957,7 +957,7 @@ void ObDDLScheduler::do_work()
             }
           }
         }
-        idle_time = ObDDLTask::DEFAULT_TASK_IDLE_TIME_US;
+        idle_time = task->get_task_idle_time_us();
       } else {
         ObCurTraceId::set(task->get_trace_id());
         int task_ret = task->process();

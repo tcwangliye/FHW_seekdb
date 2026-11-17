@@ -31,7 +31,7 @@ class ObFTParserProperty;
 
 #define FTS_STOP_WORD_MAX_LENGTH 10
 
-static const char ob_stop_word_list[][FTS_STOP_WORD_MAX_LENGTH] = {
+static constexpr char ob_stop_word_list[][FTS_STOP_WORD_MAX_LENGTH] = {
   "a",
   "about",
   "an",
@@ -101,7 +101,9 @@ public:
       const ObObjMeta &meta,
       const ObAddWordFlag &flag,
       common::ObIAllocator &allocator,
-      ObFTWordMap &word_map);
+      ObFTWordMap &word_map,
+      const char *fulltext = nullptr,
+      int64_t fulltext_len = 0);
   ~ObAddWord() = default;
   int process_word(
       const char *word,
@@ -121,6 +123,7 @@ public:
 private:
   bool is_min_max_word(const int64_t c_len) const;
   int casedown_word(const ObFTWord &src, ObFTWord &dst);
+  bool can_share_unchanged_word(const ObFTWord &word) const;
   int check_stopword(const ObFTWord &word, bool &is_stopword);
   int groupby_word(const ObFTWord &word, const int64_t word_cnt);
 private:
@@ -133,6 +136,10 @@ private:
   int64_t min_token_size_;
   int64_t max_token_size_;
   ObAddWordFlag flag_;
+  const char *fulltext_;
+  int64_t fulltext_len_;
+  char *shared_fulltext_;
+  bool can_share_fulltext_;
 };
 
 } // end namespace storage

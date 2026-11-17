@@ -38,7 +38,12 @@ int ObFTDATBuilder<DATA_TYPE>::init(ObFTTrie<DATA_TYPE> &trie)
   if (IS_INIT) {
     ret = OB_INIT_TWICE;
   } else {
-    size_t map_size = ObArrayHashMap::estimate_size(trie.node_num());
+    uint32_t unicode_pages = trie.unicode_page_count();
+    if (ObArrayHashMap::estimate_size(trie.node_num(), unicode_pages)
+        >= ObArrayHashMap::estimate_size(trie.node_num())) {
+      unicode_pages = 0;
+    }
+    size_t map_size = ObArrayHashMap::estimate_size(trie.node_num(), unicode_pages);
     size_t array_size = trie.node_num() * 6; // by experience.
     size_t base_size = array_size * sizeof(int32_t);
     size_t check_size = base_size;
@@ -53,7 +58,7 @@ int ObFTDATBuilder<DATA_TYPE>::init(ObFTTrie<DATA_TYPE> &trie)
       dat_->base_offset_ = map_size;
       dat_->check_offset_ = dat_->base_offset_ + base_size;
       map_ = dat_->get_map();
-      if (OB_FAIL(map_->init(trie.node_num()))) {
+      if (OB_FAIL(map_->init(trie.node_num(), trie.unicode_pages(), unicode_pages))) {
       }
     }
   }
@@ -302,15 +307,27 @@ ObArrayHashMap *ObFTDAT::get_map() { return reinterpret_cast<ObArrayHashMap *>(b
 int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
 {
   int ret = OB_ENTRY_NOT_EXIST;
-  uint64_t hash = word.get_word().hash();
-  uint64_t index = hash % header_.capacity_;
+  if (0 == header_.capacity_) {
+    uint32_t codepoint = 0;
+    if (ObFTSingleWord::decode_utf8(word.get_word(), codepoint)) {
+      const uint32_t offset = read_slot(codepoint >> 8);
+      const uint32_t stored_code = offset == 0 ? 0 : read_slot(offset + (codepoint & 255));
+      if (stored_code != 0) {
+        code = stored_code - 1;
+        ret = OB_SUCCESS;
+      }
+    }
+    return ret;
+  }
+  const uint64_t mask = header_.capacity_ - 1;
+  uint64_t index = word.get_word().hash() & mask;
   while (header_.data[index].used) {
     if (header_.data[index].word == word) {
       code = header_.data[index].code;
       ret = OB_SUCCESS;
       break;
     } else {
-      index = (index + 3) % header_.capacity_;
+      index = (index + 3) & mask;
     }
   }
   return ret;
@@ -319,10 +336,20 @@ int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
 int ObArrayHashMap::insert(const ObString &key, ObFTWordCode code)
 {
   int ret = OB_SUCCESS;
-  uint64_t hash = key.hash();
-  uint64_t index = hash % header_.capacity_;
+  if (0 == header_.capacity_) {
+    uint32_t codepoint = 0;
+    if (!ObFTSingleWord::decode_utf8(key, codepoint) || 0 == read_slot(codepoint >> 8)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      write_slot(read_slot(codepoint >> 8) + (codepoint & 255), code + 1);
+      ++header_.count_;
+    }
+    return ret;
+  }
+  const uint64_t mask = header_.capacity_ - 1;
+  uint64_t index = key.hash() & mask;
   while (header_.data[index].used) {
-    index = (index + 3) % header_.capacity_;
+    index = (index + 3) & mask;
   }
 
   header_.data[index].code = code;
@@ -332,30 +359,47 @@ int ObArrayHashMap::insert(const ObString &key, ObFTWordCode code)
   return ret;
 }
 
-int ObArrayHashMap::init(size_t word_num)
+int ObArrayHashMap::init(size_t word_num, const uint64_t *unicode_pages,
+                         uint32_t unicode_page_count)
 {
-  int ret = OB_SUCCESS;
-  size_t capacity = estimate_capacity(word_num);
-  size_t size = estimate_size(word_num);
-
+  const size_t size = estimate_size(word_num, unicode_page_count);
   memset(this, 0, size);
   header_.buffer_size_ = size;
-  header_.capacity_ = capacity;
+  // Zero capacity tags the direct table. Dictionary cache blocks are rebuilt
+  // in memory, so no persistent index format changes are required.
+  header_.capacity_ = unicode_page_count > 0 ? 0 : estimate_capacity(word_num);
   header_.count_ = 0;
+  if (unicode_page_count > 0) {
+    uint32_t offset = ObFTSingleWord::UNICODE_PAGE_COUNT;
+    for (uint32_t i = 0; i < ObFTSingleWord::UNICODE_PAGE_WORDS; ++i) {
+      uint64_t pages = unicode_pages[i];
+      while (pages != 0) {
+        const uint32_t page = (i << 6) + __builtin_ctzll(pages);
+        write_slot(page, offset);
+        offset += 256;
+        pages &= pages - 1;
+      }
+    }
+  }
   return OB_SUCCESS;
 }
 
-size_t ObArrayHashMap::estimate_size(size_t word_num)
+size_t ObArrayHashMap::estimate_size(size_t word_num, uint32_t unicode_page_count)
 {
-  size_t capacity = estimate_capacity(word_num);
-  size_t size = sizeof(Header) + capacity * sizeof(Entry);
-  return size;
+  return sizeof(Header) + (unicode_page_count > 0
+      ? (ObFTSingleWord::UNICODE_PAGE_COUNT + static_cast<size_t>(unicode_page_count) * 256) * sizeof(uint32_t)
+      : estimate_capacity(word_num) * sizeof(Entry));
 }
 
 size_t ObArrayHashMap::estimate_capacity(size_t word_num)
 {
-  constexpr size_t MIN_CAPACITY = 101;                   // prime
-  size_t capacity = MAX(word_num * 4 / 3, MIN_CAPACITY); // 75%
+  // These tables are rebuilt in the in-memory dictionary cache. A power-of-two
+  // capacity makes the odd probe stride cover every slot without division.
+  size_t capacity = 128;
+  const size_t required = word_num * 4 / 3;
+  while (capacity < required) {
+    capacity <<= 1;
+  }
   return capacity;
 }
 } //  namespace storage

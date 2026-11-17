@@ -51,7 +51,10 @@ TokenizeContext::TokenizeContext(ObCollationType coll_type,
                                  const char *fulltext,
                                  int64_t fulltext_len,
                                  bool is_smart)
-    : coll_type_(coll_type), fulltext_(fulltext), fulltext_len_(fulltext_len), cursor_(0),
+    : coll_type_(coll_type),
+      is_utf8_(nullptr != ObCharset::get_charset(coll_type)
+          && ObCharset::charset_type_by_coll(coll_type) == CHARSET_UTF8MB4),
+      fulltext_(fulltext), fulltext_len_(fulltext_len), cursor_(0),
       next_char_len_(0), handle_size_(0), is_smart_(is_smart), token_list_(allocator),
       result_list_(allocator)
 {
@@ -99,17 +102,54 @@ int TokenizeContext::current_char_type(ObFTCharUtil::CharType &type)
   return ret;
 }
 
-int TokenizeContext::prepare_next_char()
+int TokenizeContext::reuse(const char *fulltext,
+                           const int64_t fulltext_len,
+                           const bool is_smart)
 {
   int ret = OB_SUCCESS;
+  if (OB_ISNULL(fulltext) || fulltext_len <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    fulltext_ = fulltext;
+    fulltext_len_ = fulltext_len;
+    is_smart_ = is_smart;
+    cursor_ = 0;
+    next_char_len_ = 0;
+    reset_resource();
+    ret = prepare_next_char();
+  }
+  return ret;
+}
+
+int TokenizeContext::prepare_next_char()
+{
+  return get_char_at(cursor_, next_char_len_, next_char_type_);
+}
+
+int TokenizeContext::get_char_at(int64_t offset, int64_t &length,
+    ObFTCharUtil::CharType &type) const
+{
+  int ret = OB_SUCCESS;
+  if (is_utf8_) {
+    const unsigned char *begin = reinterpret_cast<const unsigned char *>(fulltext_ + offset);
+    const unsigned char *end = reinterpret_cast<const unsigned char *>(fulltext_ + fulltext_len_);
+    ob_wc_t unicode = 0;
+    const int size = common::ob_charset_decode_unicode<CHARSET_UTF8MB4>(begin, end, unicode);
+    if (size > 0) {
+      length = size;
+      type = ObFTCharUtil::classify_unicode(unicode);
+      return ret;
+    }
+    // Retain the original diagnostics for malformed or incomplete input.
+  }
   if (OB_FAIL(ObCharset::first_valid_char(coll_type_,
-                                          fulltext_ + cursor_,
-                                          fulltext_len_ - cursor_,
-                                          next_char_len_))) {
+                                          fulltext_ + offset,
+                                          fulltext_len_ - offset,
+                                          length))) {
   } else if (OB_FAIL(ObFTCharUtil::classify_first_char(coll_type_,
-                                                       fulltext_ + cursor_,
-                                                       next_char_len_,
-                                                       next_char_type_))) {
+                                                       fulltext_ + offset,
+                                                       length,
+                                                       type))) {
   }
   return ret;
 }
