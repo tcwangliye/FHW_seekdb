@@ -46,6 +46,7 @@ public:
         cache_quan_(allocator),
         dict_main_(nullptr),
         dict_quan_(nullptr),
+        is_shared_dict_(false),
         cs_(nullptr)
   {
   }
@@ -83,8 +84,6 @@ private:
 private:
   int init_dict(const ObFTParserParam &param);
 
-  int init_single_dict(ObFTDictDesc desc, ObFTCacheRangeContainer &container);
-
   int init_segmenter(const ObFTParserParam &param);
 
   int init_ctx(const ObFTParserParam &param);
@@ -92,10 +91,6 @@ private:
   void reset();
 
   bool should_read_newest_table() const;
-
-  int build_dict_from_cache(const ObFTDictDesc &desc,
-                            ObFTCacheRangeContainer &container,
-                            ObIFTDict *&dict);
 
 private:
   static constexpr int SEGMENT_LIMIT = 1000;
@@ -113,6 +108,8 @@ private:
 
   ObIFTDict *dict_main_;
   ObIFTDict *dict_quan_;
+  // True once the dictionaries are owned by the hub instead of this parser.
+  bool is_shared_dict_;
   const ObCharsetInfo *cs_;
   ObIKArbitrator arbitrator_;
 

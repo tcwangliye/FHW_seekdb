@@ -28,6 +28,61 @@ namespace oceanbase
 {
 namespace storage
 {
+int ObFTDictHub::get_shared_dict(const ObFTDictDesc &desc, ObIFTDict *&dict)
+{
+  int ret = OB_SUCCESS;
+  dict = nullptr;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else {
+    lib::ObMutexGuard guard(shared_dict_lock_);
+    for (int64_t i = 0; OB_SUCC(ret) && nullptr == dict && i < shared_dict_cnt_; ++i) {
+      if (shared_dicts_[i].type_ == desc.type_) {
+        dict = shared_dicts_[i].dict_;
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (nullptr != dict) {
+      // already built
+    } else if (shared_dict_cnt_ >= MAX_SHARED_DICT_CNT) {
+      ret = OB_SIZE_OVERFLOW;
+      STORAGE_LOG(WARN, "too many shared dictionaries", K(ret), K(shared_dict_cnt_));
+    } else if (OB_FAIL(build_shared_dict(desc, shared_dicts_[shared_dict_cnt_]))) {
+    } else {
+      dict = shared_dicts_[shared_dict_cnt_].dict_;
+      ++shared_dict_cnt_;
+    }
+  }
+  return ret;
+}
+
+int ObFTDictHub::build_shared_dict(const ObFTDictDesc &desc, ObFTSharedDict &shared_dict)
+{
+  int ret = OB_SUCCESS;
+  ObFTCacheRangeContainer *container = nullptr;
+  ObFTRangeDict *range_dict = nullptr;
+  if (OB_ISNULL(container = OB_NEWx(ObFTCacheRangeContainer, &shared_dict_alloc_, shared_dict_alloc_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_FAIL(load_cache(desc, *container))) {
+    if (OB_ENTRY_NOT_EXIST == ret && OB_FAIL(build_cache(desc, *container))) {
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(range_dict = OB_NEWx(ObFTRangeDict,
+                                           &shared_dict_alloc_,
+                                           shared_dict_alloc_,
+                                           container,
+                                           desc))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_FAIL(range_dict->init())) {
+  } else {
+    shared_dict.container_ = container;
+    shared_dict.dict_ = range_dict;
+    shared_dict.type_ = desc.type_;
+  }
+  return ret;
+}
+
 int ObFTDictHub::init()
 {
   static constexpr int K_MAX_DICT_BUCKET = 128; // for now, only built-in dicts.

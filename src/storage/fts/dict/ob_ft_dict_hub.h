@@ -17,8 +17,10 @@
 #ifndef _OCEANBASE_STORAGE_FTS_DICT_OB_FT_DICT_HUB_H_
 #define _OCEANBASE_STORAGE_FTS_DICT_OB_FT_DICT_HUB_H_
 
+#include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/lock/ob_bucket_lock.h"
+#include "lib/lock/ob_mutex.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
 
 namespace oceanbase
@@ -93,10 +95,33 @@ private:
 };
 
 class ObFTCacheRangeContainer;
+class ObFTRangeDict;
+class ObIFTDict;
 class ObFTDictHub
 {
 public:
-  ObFTDictHub() : is_inited_(false), dict_map_(), rw_dict_lock_() {}
+  // Built-in dictionaries are immutable and identical for every parser, so build
+  // each of them once per process. Rebuilding them per parser puts dictionary
+  // construction on the hot path of every tokenize call and every indexed
+  // document.
+  static constexpr int64_t MAX_SHARED_DICT_CNT = 4;
+  struct ObFTSharedDict
+  {
+    ObFTSharedDict()
+      : container_(nullptr), dict_(nullptr), type_(ObFTDictType::DICT_TYPE_INVALID) {}
+    ObFTCacheRangeContainer *container_;
+    ObIFTDict *dict_;
+    ObFTDictType type_;
+  };
+
+  ObFTDictHub()
+    : is_inited_(false),
+      dict_map_(),
+      rw_dict_lock_(),
+      shared_dict_lock_(),
+      shared_dict_alloc_(common::ObMemAttr("FTSharedDict")),
+      shared_dict_cnt_(0)
+  {}
   ~ObFTDictHub() {}
 
   int init();
@@ -107,6 +132,10 @@ public:
 
   int load_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &container);
 
+  // Returns the shared, read-only dictionary of the given type, building it on
+  // first use. The returned instance outlives every parser.
+  int get_shared_dict(const ObFTDictDesc &desc, ObIFTDict *&dict);
+
 private:
   int get_dict_info(const ObFTDictInfoKey &key, ObFTDictInfo &info);
 
@@ -114,10 +143,18 @@ private:
 
 
 private:
+  int build_shared_dict(const ObFTDictDesc &desc, ObFTSharedDict &shared_dict);
+
+private:
   bool is_inited_;
   // holds info of dict
   hash::ObHashMap<ObFTDictInfoKey, ObFTDictInfo> dict_map_;
   ObBucketLock rw_dict_lock_;
+
+  lib::ObMutex shared_dict_lock_;
+  common::ObArenaAllocator shared_dict_alloc_;
+  ObFTSharedDict shared_dicts_[MAX_SHARED_DICT_CNT];
+  int64_t shared_dict_cnt_;
 };
 
 } //  namespace storage
