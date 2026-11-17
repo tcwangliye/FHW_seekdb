@@ -184,6 +184,19 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else if (ascii_stopwords.check(word, is_stopword)) {
+  } else if (word.get_collation_type() == stopword_type_.get_collation_type()) {
+    // The word already uses the stop-word collation, so probe the set directly;
+    // converting it through a per-token arena is pure overhead here.
+    ret = stopword_set_.exist_refactored(word);
+    if (OB_HASH_NOT_EXIST == ret) {
+      is_stopword = false;
+      ret = OB_SUCCESS;
+    } else if (OB_HASH_EXIST == ret) {
+      is_stopword = true;
+      ret = OB_SUCCESS;
+    } else if (OB_SUCC(ret)) {
+      ret = OB_ERR_UNEXPECTED;
+    }
   } else {
     common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
     common::ObString cmp_str;
