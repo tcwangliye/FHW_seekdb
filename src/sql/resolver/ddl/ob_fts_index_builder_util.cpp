@@ -1033,8 +1033,10 @@ int ObFtsIndexBuilderUtil::generate_doc_id_column(
 
 // Lowest degree used when building a posting table, independent of the table's
 // own DOP: a single writer cannot hide the memory latency of a term-ordered
-// build, and every extra writer has been measured to pay for itself.
-static const int64_t FTS_POSTING_BUILD_MIN_PARALLELISM = 8;
+// build. Four is the measured limit here; eight writers were measured to make a
+// build more than twice as slow on a machine with fewer cores, because the extra
+// slice writers contend for the same tablet.
+static const int64_t FTS_POSTING_BUILD_MIN_PARALLELISM = 4;
 
 int ObFtsIndexBuilderUtil::decide_parallelism(
     const share::schema::ObIndexType index_type,

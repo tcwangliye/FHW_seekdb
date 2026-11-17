@@ -383,6 +383,28 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
   int ret = OB_SUCCESS;
   bool found = false;
   if (ordered_ranges_) {
+    // The result only depends on the first character of the word, and the IK
+    // processors probe the same position with several prefix lengths, so remember
+    // the last decisive character per thread instead of searching again.
+    struct FirstCharCache
+    {
+      const ObFTRangeDict *owner;
+      char first_[4];
+      int64_t len_;
+      ObIFTDict *dict_;
+    };
+    static thread_local FirstCharCache cache = {nullptr, {0, 0, 0, 0}, 0, nullptr};
+    int64_t first_len = 1;
+    if (single_word.length() > 0) {
+      const unsigned char lead = static_cast<unsigned char>(single_word.ptr()[0]);
+      first_len = lead >= 0xF0 ? 4 : (lead >= 0xE0 ? 3 : (lead >= 0xC0 ? 2 : 1));
+      first_len = MIN(first_len, single_word.length());
+    }
+    if (nullptr != cache.owner && cache.owner == this && cache.len_ == first_len
+        && 0 == MEMCMP(cache.first_, single_word.ptr(), static_cast<size_t>(first_len))) {
+      dict = cache.dict_;
+      return OB_SUCCESS;
+    }
     int64_t left = 0;
     int64_t right = range_dicts_.count();
     while (left < right) {
@@ -397,6 +419,10 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
     if (left < range_dicts_.count()
         && range_dicts_[left].start_.get_word().compare(single_word) <= 0) {
       dict = range_dicts_[left].dict_;
+      cache.owner = this;
+      cache.len_ = first_len;
+      MEMCPY(cache.first_, single_word.ptr(), static_cast<size_t>(first_len));
+      cache.dict_ = dict;
       return OB_SUCCESS;
     }
     return OB_ENTRY_NOT_EXIST;
