@@ -85,6 +85,11 @@ ObSharedMacroBlockMgr::~ObSharedMacroBlockMgr()
 
 void ObSharedMacroBlockMgr::destroy()
 {
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(wait_all_pending_blocks())) {
+    STORAGE_LOG(WARN, "fail to drain pending block writes", K(ret));
+  }
+  pending_writes_.reset();
   defragment_timer_.destroy();
   macro_handle_.reset();
   offset_ = OB_DEFAULT_MACRO_BLOCK_SIZE; // so we can init block automatically for first write
@@ -190,7 +195,13 @@ int ObSharedMacroBlockMgr::write_block(
     if (OB_SUCC(ret)) {
       write_info.offset_ = offset_;
       write_info.io_timeout_ms_ = std::max(config::_data_storage_io_timeout() / 1000, DEFAULT_IO_WAIT_TIME_MS);
-      if (OB_FAIL(do_write_block(macro_handle_.get_macro_id(), write_info, block_info))) {
+      if (pending_writes_.count() >= SMALL_BLOCK_IO_WINDOW
+          && OB_FAIL(wait_pending_block())) {
+      } else if (OB_FAIL(submit_block(macro_handle_.get_macro_id(),
+                                      write_info.offset_,
+                                      write_info.size_,
+                                      write_info.buffer_,
+                                      block_info))) {
       }
 
       // no matter success or failure, advance offset_
@@ -206,6 +217,73 @@ int ObSharedMacroBlockMgr::write_block(
     }
   }
 
+  return ret;
+}
+
+int ObSharedMacroBlockMgr::submit_block(
+    const MacroBlockId &macro_id,
+    const int64_t offset,
+    const int64_t size,
+    const char *buf,
+    ObBlockInfo &block_info)
+{
+  int ret = OB_SUCCESS;
+  ObPendingBlockWrite pending;
+  if (OB_UNLIKELY(!macro_id.is_valid() || size <= 0 || nullptr == buf)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_ISNULL(pending.buf_ = static_cast<char *>(ob_malloc(size, "SharedBlkIO")))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    STORAGE_LOG(WARN, "fail to alloc block write buffer", K(ret), K(size));
+  } else {
+    MEMCPY(pending.buf_, buf, size);
+    pending.size_ = size;
+    pending.offset_ = offset;
+    ObMacroBlockWriteInfo write_info;
+    write_info.buffer_ = pending.buf_;
+    write_info.size_ = size;
+    write_info.offset_ = offset;
+    write_info.io_desc_.set_wait_event(ObWaitEventIds::DB_FILE_COMPACT_WRITE);
+    write_info.io_timeout_ms_ = std::max(config::_data_storage_io_timeout() / 1000, DEFAULT_IO_WAIT_TIME_MS);
+    block_info.macro_id_ = macro_id;
+    block_info.nested_size_ = size;
+    block_info.nested_offset_ = offset;
+    if (OB_FAIL(pending.handle_.set_macro_block_id(macro_id))) {
+    } else if (OB_FAIL(pending.handle_.async_write(write_info))) {
+    } else if (OB_FAIL(pending_writes_.push_back(pending))) {
+    }
+    if (OB_FAIL(ret) && OB_NOT_NULL(pending.buf_)) {
+      ob_free(pending.buf_);
+      pending.buf_ = nullptr;
+    }
+  }
+  return ret;
+}
+
+int ObSharedMacroBlockMgr::wait_pending_block()
+{
+  int ret = OB_SUCCESS;
+  if (pending_writes_.count() > 0) {
+    ObPendingBlockWrite &pending = pending_writes_.at(0);
+    if (OB_FAIL(pending.handle_.wait())) {
+      STORAGE_LOG(WARN, "fail to wait small sstable block write", K(ret), K(pending));
+    }
+    if (OB_NOT_NULL(pending.buf_)) {
+      ob_free(pending.buf_);
+      pending.buf_ = nullptr;
+    }
+    if (OB_FAIL(pending_writes_.remove(0))) {
+    }
+  }
+  return ret;
+}
+
+int ObSharedMacroBlockMgr::wait_all_pending_blocks()
+{
+  int ret = OB_SUCCESS;
+  while (OB_SUCC(ret) && pending_writes_.count() > 0) {
+    if (OB_FAIL(wait_pending_block())) {
+    }
+  }
   return ret;
 }
 
@@ -279,8 +357,9 @@ int ObSharedMacroBlockMgr::try_switch_macro_block()
   const MacroBlockId &block_id = macro_handle_.get_macro_id();
   const int32_t used_size = offset_;
   ObMacroBlockHandle new_macro_handle;
-  // we add_block_size extraly to avoid defragmenting the previous block if some sstables haven't been inited
-  if (block_id.is_valid() && OB_FAIL(add_block(block_id, used_size))) {
+  // Queued writes target this block; drain them before handing it over.
+  if (OB_FAIL(wait_all_pending_blocks())) {
+  } else if (block_id.is_valid() && OB_FAIL(add_block(block_id, used_size))) {
   } else if (FALSE_IT(macro_handle_.reset())) {
   } else if (FALSE_IT(offset_ = OB_DEFAULT_MACRO_BLOCK_SIZE /* invalid offset */)) {
   } else if (OB_FAIL(OB_SERVER_BLOCK_MGR.alloc_block(new_macro_handle))) {

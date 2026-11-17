@@ -56,6 +56,19 @@ public:
 class ObSharedMacroBlockMgr final
 {
 public:
+  // Small-sstable blocks are packed into one shared macro block while a global
+  // mutex is held. Keep the writes in flight so the lock covers only the offset
+  // assignment instead of a full synchronous write.
+  static const int64_t SMALL_BLOCK_IO_WINDOW = 8;
+  struct ObPendingBlockWrite
+  {
+    ObPendingBlockWrite() : handle_(), buf_(nullptr), size_(0), offset_(0) {}
+    ObMacroBlockHandle handle_;
+    char *buf_;
+    int64_t size_;
+    int64_t offset_;
+    TO_STRING_KV(K_(size), K_(offset), KP_(buf));
+  };
   ObSharedMacroBlockMgr();
   ~ObSharedMacroBlockMgr();
   void destroy();
@@ -65,6 +78,13 @@ public:
   void wait();
   void get_cur_shared_block(MacroBlockId &macro_id);
   int write_block(const char* buf, const int64_t size, ObBlockInfo &block_info, ObMacroBlocksWriteCtx &write_ctx);
+  int submit_block(const MacroBlockId &macro_id,
+                   const int64_t offset,
+                   const int64_t size,
+                   const char *buf,
+                   ObBlockInfo &block_info);
+  int wait_pending_block();
+  int wait_all_pending_blocks();
   int add_block(const MacroBlockId &block_id, const int64_t block_size);
   int free_block(const MacroBlockId &block_id, const int64_t block_size);
   bool is_recyclable(const MacroBlockId &macro_id, const int64_t &used_size) const ;
@@ -187,6 +207,7 @@ private:
 
 private:
   ObMacroBlockHandle macro_handle_;
+  common::ObSEArray<ObPendingBlockWrite, SMALL_BLOCK_IO_WINDOW> pending_writes_;
   int64_t offset_;
   char *common_header_buf_;
   int64_t header_size_;
