@@ -76,12 +76,62 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
   return ret;
 }
 
+namespace
+{
+// A constant document is usually tokenized once per row, and the result depends only
+// on the text, the parser, its properties and the output mode, so keep the last result
+// per thread and hand it out again instead of segmenting the same text again.
+struct ObTokenizeResultCache
+{
+  ObTokenizeResultCache()
+    : arena_(common::ObMemAttr("TokResultCache")),
+      mode_(0),
+      coll_type_(CS_TYPE_INVALID),
+      json_(nullptr),
+      valid_(false)
+  {}
+
+  void reset_entry()
+  {
+    arena_.reset();
+    text_.reset();
+    parser_name_.reset();
+    properties_.reset();
+    json_ = nullptr;
+    valid_ = false;
+  }
+
+  common::ObArenaAllocator arena_;
+  common::ObString text_;
+  common::ObString parser_name_;
+  common::ObString properties_;
+  int64_t mode_; // ObExprTokenize::TokenizeParam::OUTPUT_MODE, kept as an int outside the class
+  ObCollationType coll_type_;
+  ObIJsonBase *json_;
+  bool valid_;
+};
+thread_local ObTokenizeResultCache g_tokenize_result_cache;
+} // anonymous namespace
+
 int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
                                       TokenizeParam::OUTPUT_MODE mode,
                                       ObIAllocator &allocator,
                                       ObIJsonBase *&result)
 {
   int ret = OB_SUCCESS;
+  UNUSED(allocator);
+  ObTokenizeResultCache &cache = g_tokenize_result_cache;
+  const ObCollationType coll_type = param.meta_.get_collation_type();
+  if (cache.valid_
+      && cache.mode_ == static_cast<int64_t>(mode)
+      && cache.coll_type_ == coll_type
+      && cache.text_ == param.fulltext_
+      && cache.parser_name_ == param.parser_name_
+      && cache.properties_ == param.properties_) {
+    result = cache.json_;
+    return ret;
+  }
+  cache.reset_entry();
   storage::ObFTParseHelper tokenize_helper;
   const int64_t ft_word_bkt_cnt = MIN(MAX(param.fulltext_.length() / 2, 2), 997);
   int64_t doc_len = 0;
@@ -89,7 +139,7 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
 
   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(tokenize_helper.init(&allocator, param.parser_name_, param.properties_))) {
+  } else if (OB_FAIL(tokenize_helper.init(&cache.arena_, param.parser_name_, param.properties_))) {
   } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
   } else if (
       (0 != param.fulltext_.length())
@@ -117,6 +167,23 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
     }
     default:
       ret = OB_INVALID_ARGUMENT;
+    }
+    if (OB_SUCC(ret)) {
+      common::ObString copied_text;
+      common::ObString copied_parser;
+      common::ObString copied_props;
+      if (OB_FAIL(ob_write_string(cache.arena_, param.fulltext_, copied_text))) {
+      } else if (OB_FAIL(ob_write_string(cache.arena_, param.parser_name_, copied_parser))) {
+      } else if (OB_FAIL(ob_write_string(cache.arena_, param.properties_, copied_props))) {
+      } else {
+        cache.text_ = copied_text;
+        cache.parser_name_ = copied_parser;
+        cache.properties_ = copied_props;
+        cache.mode_ = static_cast<int64_t>(mode);
+        cache.coll_type_ = coll_type;
+        cache.json_ = result;
+        cache.valid_ = true;
+      }
     }
   }
   return ret;
