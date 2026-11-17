@@ -32,10 +32,14 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   dset.dl_tensor.shape = ds; dset.dl_tensor.strides = 0; dset.dl_tensor.byte_offset = 0;
 
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
-  h->ip->build_algo = NN_DESCENT;
-  h->ip->graph_degree = 128;
-  h->ip->intermediate_graph_degree = 256;
-  h->ip->nn_descent_niter = 100;
+  /* The library picks the all-neighbours builder itself (IVF-PQ for a dataset of
+   * this size) and tunes it, instead of the experimental NN-descent path with an
+   * inflated intermediate degree and iteration count that this bridge used to
+   * hard-code. graph_degree/intermediate_graph_degree keep the values
+   * cuvsCagraIndexParamsCreate() just set, i.e. the library defaults. */
+  h->ip->build_algo = AUTO_SELECT;
+  fprintf(stderr, "[seekdb_cuvs] build n=%ld dim=%ld algo=auto_select igraph=%zu graph=%zu\n",
+          n, dim, h->ip->intermediate_graph_degree, h->ip->graph_degree);
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
   h->n = n; h->dim = dim;
