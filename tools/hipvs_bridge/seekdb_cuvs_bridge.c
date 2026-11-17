@@ -10,6 +10,17 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+/* Page-locked host staging goes through the platform's own API: ROCm ships
+ * hipHostMalloc/hipHostFree, the CUDA build keeps cudaMallocHost/cudaFreeHost. */
+#ifdef __HIP_PLATFORM_AMD__
+#define SK_HOST_ALLOC(p, n) hipHostMalloc((void **)(p), (n), 0)
+#define SK_HOST_FREE(p) hipHostFree(p)
+#else
+#define SK_HOST_ALLOC(p, n) cudaMallocHost((void **)(p), (n))
+#define SK_HOST_FREE(p) cudaFreeHost(p)
+#endif
 
 typedef struct {
   cuvsResources_t        res;
@@ -22,8 +33,11 @@ typedef struct {
   float    *qd;  /* device queries, kept across searches */
   unsigned *nd;  /* device ids      */
   float    *dd;  /* device distance */
-  long q_cap;    /* capacity of qd in floats   */
-  long out_cap;  /* capacity of nd/dd in entries */
+  float    *qh;  /* page-locked host queries  */
+  unsigned *nh;  /* page-locked host ids      */
+  float    *dh;  /* page-locked host distance */
+  long q_cap;    /* capacity of qd/qh in floats   */
+  long out_cap;  /* capacity of nd/nh/dd/dh in entries */
 } sk_cuvs_index;
 
 /* Grows the scratch buffers to hold nq queries with topk results each. */
@@ -33,14 +47,20 @@ static int sk_ensure_buffers(sk_cuvs_index *h, long nq, long topk)
   const long out_need = nq * topk;
   if (q_need > h->q_cap) {
     if (h->qd) { cuvsRMMFree(h->res, h->qd, sizeof(float) * h->q_cap); h->qd = NULL; }
+    if (h->qh) { SK_HOST_FREE(h->qh); h->qh = NULL; }
     if (cuvsRMMAlloc(h->res, (void**)&h->qd, sizeof(float) * q_need) != CUVS_SUCCESS) { return 10; }
+    if (SK_HOST_ALLOC((void**)&h->qh, sizeof(float) * q_need) != 0) { return 11; }
     h->q_cap = q_need;
   }
   if (out_need > h->out_cap) {
     if (h->nd) { cuvsRMMFree(h->res, h->nd, sizeof(unsigned) * h->out_cap); h->nd = NULL; }
     if (h->dd) { cuvsRMMFree(h->res, h->dd, sizeof(float) * h->out_cap); h->dd = NULL; }
+    if (h->nh) { SK_HOST_FREE(h->nh); h->nh = NULL; }
+    if (h->dh) { SK_HOST_FREE(h->dh); h->dh = NULL; }
     if (cuvsRMMAlloc(h->res, (void**)&h->nd, sizeof(unsigned) * out_need) != CUVS_SUCCESS) { return 12; }
     if (cuvsRMMAlloc(h->res, (void**)&h->dd, sizeof(float) * out_need) != CUVS_SUCCESS) { return 12; }
+    if (SK_HOST_ALLOC((void**)&h->nh, sizeof(unsigned) * out_need) != 0) { return 13; }
+    if (SK_HOST_ALLOC((void**)&h->dh, sizeof(float) * out_need) != 0) { return 13; }
     h->out_cap = out_need;
   }
   return 0;
@@ -89,7 +109,8 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
   float* qd = 0; unsigned* nd = 0; float* dd = 0; cuvsCagraSearchParams_t sp = 0;
   if ((rc = sk_ensure_buffers(h, nq, topk)) != 0) { goto done; }
   qd = h->qd; nd = h->nd; dd = h->dd;
-  if (cudaMemcpy(qd, query, sizeof(float)*nq*h->dim, cudaMemcpyDefault) != cudaSuccess) { rc=13; goto done; }
+  memcpy(h->qh, query, sizeof(float)*nq*h->dim);
+  if (cudaMemcpy(qd, h->qh, sizeof(float)*nq*h->dim, cudaMemcpyDefault) != cudaSuccess) { rc=13; goto done; }
   {
     DLManagedTensor qt, nt, dt; long qs[2]={nq,h->dim}, nsh[2]={nq,topk}, dsh[2]={nq,topk};
     qt.dl_tensor.data=qd; qt.dl_tensor.device.device_type=kDLCUDA; qt.dl_tensor.device.device_id=0;
@@ -106,8 +127,12 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
     }
     cuvsFilter f; f.type=NO_FILTER; f.addr=(uintptr_t)0;
     if (cuvsCagraSearch(h->res, sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) { rc=15; goto done; }
-    if (cudaMemcpy(out_ids, nd, sizeof(unsigned)*nq*topk, cudaMemcpyDefault) != cudaSuccess) { rc=16; goto done; }
-    if (out_dist && cudaMemcpy(out_dist, dd, sizeof(float)*nq*topk, cudaMemcpyDefault) != cudaSuccess) { rc=17; goto done; }
+    if (cudaMemcpy(h->nh, nd, sizeof(unsigned)*nq*topk, cudaMemcpyDefault) != cudaSuccess) { rc=16; goto done; }
+    memcpy(out_ids, h->nh, sizeof(unsigned)*nq*topk);
+    if (out_dist) {
+      if (cudaMemcpy(h->dh, dd, sizeof(float)*nq*topk, cudaMemcpyDefault) != cudaSuccess) { rc=17; goto done; }
+      memcpy(out_dist, h->dh, sizeof(float)*nq*topk);
+    }
   }
 done:
   if (sp) cuvsCagraSearchParamsDestroy(sp);
@@ -122,6 +147,9 @@ void seekdb_cuvs_free(void* handle)
   if (h->qd) cuvsRMMFree(h->res, h->qd, sizeof(float) * h->q_cap);
   if (h->nd) cuvsRMMFree(h->res, h->nd, sizeof(unsigned) * h->out_cap);
   if (h->dd) cuvsRMMFree(h->res, h->dd, sizeof(float) * h->out_cap);
+  if (h->qh) SK_HOST_FREE(h->qh);
+  if (h->nh) SK_HOST_FREE(h->nh);
+  if (h->dh) SK_HOST_FREE(h->dh);
   cuvsCagraIndexDestroy(h->idx);
   cuvsCagraIndexParamsDestroy(h->ip);
   cuvsResourcesDestroy(h->res);
