@@ -1873,6 +1873,40 @@ int ObDDLTaskRecordOperator::update_task_status(
   return ret;
 }
 
+int ObDDLTaskRecordOperator::get_task_status(
+    common::ObISQLClient &proxy,
+    const int64_t task_id,
+    int64_t &task_status,
+    int64_t &ret_code,
+    bool &found)
+{
+  int ret = OB_SUCCESS;
+  task_status = 0;
+  ret_code = OB_SUCCESS;
+  found = false;
+  ObSqlString sql_string;
+  SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+    sqlclient::ObMySQLResult *result = nullptr;
+    if (OB_UNLIKELY(task_id <= 0)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (OB_FAIL(sql_string.assign_fmt(" SELECT status, ret_code FROM %s WHERE task_id = %lu",
+        OB_ALL_DDL_TASK_STATUS_TNAME, task_id))) {
+    } else if (OB_FAIL(proxy.read(res, sql_string.ptr()))) {
+    } else if (OB_ISNULL(result = res.get_result())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(result->next())) {
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+      }
+    } else {
+      found = true;
+      EXTRACT_INT_FIELD_MYSQL(*result, "status", task_status, int64_t);
+      EXTRACT_INT_FIELD_MYSQL(*result, "ret_code", ret_code, int64_t);
+    }
+  }
+  return ret;
+}
+
 int ObDDLTaskRecordOperator::update_snapshot_version_if_not_exist(
     common::ObISQLClient &sql_client,
     const int64_t task_id,

@@ -296,6 +296,7 @@ protected:
   ObArenaAllocator rowkey_arena_;
   blocksstable::ObDatumRowkey last_key_; // for check order row by row, consider macro block writer will not checkit when append_batch
   blocksstable::ObStorageDatumUtils datum_utils_;
+  common::ObArray<common::ObDatum *> storage_datums_; // reused by every converted row
 };
 
 class ObHeapBatchSliceWriter : public ObBatchSliceWriter

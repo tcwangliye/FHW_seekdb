@@ -909,8 +909,30 @@ int ObFtsIndexBuildTask::wait_aux_table_complement()
                                                       unused_user_msg_len))) {
             if (OB_ENTRY_NOT_EXIST == ret) {
               ret = OB_SUCCESS;
-              LOG_INFO("ddl task not finish", K(task_key),
-                  K(child_task_id), K(target_object_id));
+              bool child_finished = false;
+              bool child_lost = false;
+              int64_t child_ret_code = OB_SUCCESS;
+              if (OB_FAIL(get_child_task_state(task_key, child_task_id,
+                                               child_finished, child_lost, child_ret_code))) {
+              } else if (child_finished) {
+                finished_task_cnt++;
+                if (OB_SUCCESS != child_ret_code) {
+                  ret = child_ret_code;
+                  child_task_failed = true;
+                  state_finished = true;
+                  break;
+                }
+              } else if (child_lost) {
+                LOG_WARN("child ddl task disappeared before publishing its table",
+                    K(task_key), K(child_task_id), K(target_object_id));
+                ret = OB_ENTRY_NOT_EXIST;
+                child_task_failed = true;
+                state_finished = true;
+                break;
+              } else {
+                LOG_INFO("ddl task not finish", K(task_key),
+                    K(child_task_id), K(target_object_id));
+              }
             } else {
             }
           } else {
@@ -956,6 +978,86 @@ int ObFtsIndexBuildTask::wait_aux_table_complement()
 
     (void)switch_status(next_status, next_status != ObDDLTaskStatus::FAIL, ret);
     ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+int ObFtsIndexBuildTask::unlock_child_tasks(
+    common::ObMySQLTransaction &trans, const ObTableSchema &data_schema)
+{
+  int ret = OB_SUCCESS;
+  if (!dependent_task_result_map_.created()) {
+    // Nothing was submitted yet.
+  } else {
+    using task_iter = common::hash::ObHashMap<uint64_t, rootserver::ObDomainDependTaskStatus>::const_iterator;
+    for (task_iter iter = dependent_task_result_map_.begin();
+         OB_SUCC(ret) && iter != dependent_task_result_map_.end(); ++iter) {
+      const uint64_t aux_table_id = iter->first;
+      const int64_t child_task_id = iter->second.task_id_;
+      ObTableLockOwnerID child_owner_id;
+      if (child_task_id <= 0) {
+        // The auxiliary table already existed, so no child build was submitted.
+      } else if (OB_FAIL(child_owner_id.convert_from_value(
+                     ObLockOwnerType::DEFAULT_OWNER_TYPE, child_task_id))) {
+      } else {
+        // Best effort: a child that already finished released its own locks.
+        const int tmp_ret = ObDDLLock::unlock_for_add_drop_index(
+            data_schema, aux_table_id, false /* is_global_index */, child_owner_id, trans);
+        if (OB_SUCCESS != tmp_ret && OB_OBJ_LOCK_NOT_EXIST != tmp_ret) {
+          LOG_WARN("failed to unlock child aux table", K(tmp_ret), K(aux_table_id), K(child_task_id));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+
+// is removed only after its index table is published. So an error message that
+// has already been aged out is not proof that the child is still running: check
+// the task record, then the published schema, and only then declare it lost.
+int ObFtsIndexBuildTask::get_child_task_state(
+    const uint64_t aux_table_id,
+    const int64_t child_task_id,
+    bool &finished,
+    bool &lost,
+    int64_t &child_ret_code)
+{
+  int ret = OB_SUCCESS;
+  finished = false;
+  lost = false;
+  child_ret_code = OB_SUCCESS;
+  int64_t task_status = 0;
+  bool found = false;
+  if (OB_ISNULL(GCTX.sql_proxy_) || OB_ISNULL(GCTX.schema_service_)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(ObDDLTaskRecordOperator::get_task_status(
+                 *GCTX.sql_proxy_, child_task_id, task_status, child_ret_code, found))) {
+  } else if (found) {
+    if (static_cast<int64_t>(ObDDLTaskStatus::SUCCESS) == task_status) {
+      finished = true;
+    } else if (static_cast<int64_t>(ObDDLTaskStatus::FAIL) == task_status) {
+      finished = true;
+      if (OB_SUCCESS == child_ret_code) {
+        child_ret_code = OB_ERR_UNEXPECTED;
+      }
+    }
+  } else {
+    ObSchemaGetterGuard schema_guard;
+    const ObTableSchema *aux_schema = nullptr;
+    if (OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(schema_guard))) {
+    } else if (OB_FAIL(schema_guard.get_table_schema(aux_table_id, aux_schema))) {
+    } else if (OB_ISNULL(aux_schema)) {
+      lost = true;
+    } else if (INDEX_STATUS_AVAILABLE == aux_schema->get_index_status()) {
+      finished = true;
+    } else if (INDEX_STATUS_INDEX_ERROR == aux_schema->get_index_status()) {
+      finished = true;
+      child_ret_code = OB_ERR_UNEXPECTED;
+    } else {
+      // No task record and nothing published: the child is gone.
+      lost = true;
+    }
   }
   return ret;
 }
@@ -1800,6 +1902,7 @@ int ObFtsIndexBuildTask::cleanup_impl()
     }
     if (OB_FAIL(ret)) {
     } else if (snapshot_version_ > 0 && OB_FAIL(try_release_snapshot(trans))) {
+    } else if (OB_FAIL(unlock_child_tasks(trans, *data_schema))) {
     }
     if (trans.is_started()) {
       int tmp_ret = OB_SUCCESS;

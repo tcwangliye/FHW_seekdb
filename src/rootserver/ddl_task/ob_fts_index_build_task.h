@@ -129,6 +129,13 @@ private:
       bool &task_submitted,
       uint64_t &aux_table_id,
       int64_t &task_id);
+  int unlock_child_tasks(common::ObMySQLTransaction &trans, const ObTableSchema &data_schema);
+  int get_child_task_state(
+      const uint64_t aux_table_id,
+      const int64_t child_task_id,
+      bool &finished,
+      bool &lost,
+      int64_t &child_ret_code);
   int prepare_aux_tables();
   int prepare_rowkey_doc_table();
   int prepare_aux_index_tables(const bool finish_state = true);

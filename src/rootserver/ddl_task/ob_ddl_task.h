@@ -310,6 +310,15 @@ public:
       common::ObISQLClient &proxy,
       const int64_t task_id,
       const int64_t task_status);
+
+  // Reads status and ret_code of one task record without locking it. A parent
+  // task uses this to tell a still-running child from one whose record is gone.
+  static int get_task_status(
+      common::ObISQLClient &proxy,
+      const int64_t task_id,
+      int64_t &task_status,
+      int64_t &ret_code,
+      bool &found);
   
   static int update_snapshot_version_if_not_exist(
       common::ObISQLClient &sql_client,

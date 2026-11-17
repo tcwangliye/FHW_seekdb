@@ -721,23 +721,29 @@ int ObBatchSliceWriter::append_current_row(const ObIArray<ObDatum *> &datums)
     if (OB_FAIL(row_buffer_.append_row(datums))) {
     }
   } else {
-    row_arena_.reuse();
-    ObArray<ObDatum *> storage_datums;
+    // Converted values are copied into row_buffer_ below, so the arena only has
+    // to be recycled once it has grown, not for every row. Both the reset and the
+    // per-row temporary array were two allocations per output row.
+    static const int64_t ROW_ARENA_RESET_THRESHOLD = 256 * 1024;
+    if (row_arena_.used() > ROW_ARENA_RESET_THRESHOLD) {
+      row_arena_.reuse();
+    }
+    storage_datums_.reuse();
     if (OB_FAIL(build_multi_version_row(datums))) {
     } else if (OB_FAIL(ObDDLStorageUtil::convert_to_storage_row(tablet_id_, slice_idx_, writer_param_, lob_writer_, row_arena_, current_row_))) {
-    } else if (OB_FAIL(storage_datums.reserve(sql_column_count_))) {
+    } else if (OB_FAIL(storage_datums_.reserve(sql_column_count_))) {
     } else {
       const int64_t multi_version_col_cnt = ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt();
       for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_column_count_; ++i) {
-        if (OB_FAIL(storage_datums.push_back(&current_row_.storage_datums_[i]))) {
+        if (OB_FAIL(storage_datums_.push_back(&current_row_.storage_datums_[i]))) {
         }
       }
       for (int64_t i = rowkey_column_count_; OB_SUCC(ret) && i < sql_column_count_; ++i) {
-        if (OB_FAIL(storage_datums.push_back(&current_row_.storage_datums_[i + multi_version_col_cnt]))) {
+        if (OB_FAIL(storage_datums_.push_back(&current_row_.storage_datums_[i + multi_version_col_cnt]))) {
         }
       }
       if (OB_SUCC(ret)) {
-        if (OB_FAIL(row_buffer_.append_row(storage_datums))) {
+        if (OB_FAIL(row_buffer_.append_row(storage_datums_))) {
         }
       }
     }
