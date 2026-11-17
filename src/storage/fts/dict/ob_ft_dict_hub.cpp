@@ -31,9 +31,28 @@ namespace storage
 int ObFTDictHub::get_shared_dict(const ObFTDictDesc &desc, ObIFTDict *&dict)
 {
   int ret = OB_SUCCESS;
+  // Each parser initialisation asks for the same immutable dictionaries, so keep
+  // the answer per thread and touch the lock only when a dictionary is built.
+  struct SharedDictCache
+  {
+    const ObFTDictHub *owner_;
+    ObIFTDict *main_;
+    ObIFTDict *quan_;
+  };
+  static thread_local SharedDictCache cache = {nullptr, nullptr, nullptr};
   dict = nullptr;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
+  } else if (cache.owner_ != this) {
+    cache.owner_ = this;
+    cache.main_ = nullptr;
+    cache.quan_ = nullptr;
+  }
+  if (OB_FAIL(ret)) {
+  } else if (ObFTDictType::DICT_IK_MAIN == desc.type_ && nullptr != cache.main_) {
+    dict = cache.main_;
+  } else if (ObFTDictType::DICT_IK_QUAN == desc.type_ && nullptr != cache.quan_) {
+    dict = cache.quan_;
   } else {
     lib::ObMutexGuard guard(shared_dict_lock_);
     for (int64_t i = 0; OB_SUCC(ret) && nullptr == dict && i < shared_dict_cnt_; ++i) {
@@ -51,6 +70,13 @@ int ObFTDictHub::get_shared_dict(const ObFTDictDesc &desc, ObIFTDict *&dict)
     } else {
       dict = shared_dicts_[shared_dict_cnt_].dict_;
       ++shared_dict_cnt_;
+    }
+    if (OB_SUCC(ret)) {
+      if (ObFTDictType::DICT_IK_MAIN == desc.type_) {
+        cache.main_ = dict;
+      } else if (ObFTDictType::DICT_IK_QUAN == desc.type_) {
+        cache.quan_ = dict;
+      }
     }
   }
   return ret;

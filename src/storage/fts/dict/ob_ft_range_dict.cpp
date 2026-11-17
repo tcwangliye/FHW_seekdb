@@ -383,6 +383,15 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
   int ret = OB_SUCCESS;
   bool found = false;
   if (ordered_ranges_) {
+    if (first_byte_table_built_ && !single_word.empty()) {
+      const int32_t range_idx = first_byte_range_[static_cast<unsigned char>(single_word.ptr()[0])];
+      if (range_idx >= 0 && range_idx < range_dicts_.count()
+          && range_dicts_[range_idx].start_.get_word().compare(single_word) <= 0
+          && range_dicts_[range_idx].end_.get_word().compare(single_word) >= 0) {
+        dict = range_dicts_[range_idx].dict_;
+        return OB_SUCCESS;
+      }
+    }
     // The result only depends on the first character of the word, and the IK
     // processors probe the same position with several prefix lengths, so remember
     // the last decisive character per thread instead of searching again.
@@ -468,7 +477,30 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
       }
     }
   }
+  if (OB_SUCC(ret) && ordered_ranges_ && !first_byte_table_built_) {
+    build_first_byte_table();
+    first_byte_table_built_ = true;
+  }
   return ret;
+}
+
+void ObFTRangeDict::build_first_byte_table()
+{
+  for (int64_t b = 0; b < 256; ++b) {
+    first_byte_range_[b] = -1;
+  }
+  for (int64_t i = 0; i < range_dicts_.count(); ++i) {
+    const ObString start = range_dicts_[i].start_.get_word();
+    const ObString end = range_dicts_[i].end_.get_word();
+    if (start.empty() || end.empty()) {
+      continue;
+    }
+    const int64_t start_byte = static_cast<unsigned char>(start.ptr()[0]);
+    const int64_t end_byte = static_cast<unsigned char>(end.ptr()[0]);
+    for (int64_t b = start_byte; b <= end_byte && b < 256; ++b) {
+      first_byte_range_[b] = static_cast<int32_t>(i);
+    }
+  }
 }
 
 int ObFTRangeDict::build_cache(const ObFTDictDesc &desc, ObFTCacheRangeContainer &range_container)

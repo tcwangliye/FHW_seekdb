@@ -41,7 +41,9 @@ public:
                 const ObFTDictDesc &desc)
       : is_inited_(false), desc_(desc), range_alloc_(alloc),
         range_dicts_(OB_MALLOC_NORMAL_BLOCK_SIZE, range_alloc_),
-        range_container_(range_container), ordered_ranges_(true)
+        first_byte_table_built_(false),
+        range_container_(range_container),
+        ordered_ranges_(true)
   {
   }
   ~ObFTRangeDict() override { destroy(); }
@@ -107,6 +109,12 @@ private:
   ObFTDictDesc desc_;
   ObWrapperAllocator range_alloc_;
   ObSEArray<ObFTRange, 8, ObWrapperAllocator> range_dicts_;
+  // The ranges partition the key space by first character, and a UTF-8 first
+  // character is determined by its leading byte, so the owning range of any word
+  // can be found with one table lookup instead of a binary search.
+  int32_t first_byte_range_[256];
+  bool first_byte_table_built_;
+  void build_first_byte_table();
   ObFTCacheRangeContainer *range_container_; // only used to read cache
   bool ordered_ranges_;
 

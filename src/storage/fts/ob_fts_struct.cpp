@@ -28,13 +28,23 @@ namespace storage
 int ObFTWord::hash(uint64_t &hash_val) const
 {
   int ret = OB_SUCCESS;
-  common::ObDatumBasicFuncs *funcs = ObDatumFuncs::get_basic_func(meta_.get_type(), meta_.get_collation_type());
-  if (OB_ISNULL(funcs)) {
-    ret = OB_ERR_UNEXPECTED;
-  } else if (funcs->default_hash_ == nullptr) {
-    ret = OB_ERR_UNEXPECTED;
+  if (OB_LIKELY(ObVarcharType == meta_.get_type()
+                && CS_TYPE_UTF8MB4_BIN == meta_.get_collation_type()
+                && !word_.is_null()
+                && !word_.is_ext())) {
+    // operator== compares these keys byte by byte, so a byte hash is consistent
+    // with equality and avoids decoding every character into a sort weight.
+    hash_val = murmurhash(word_.ptr_, static_cast<int32_t>(word_.len_), 0);
   } else {
-    ret = funcs->default_hash_(word_, 0, hash_val, nullptr);
+    common::ObDatumBasicFuncs *funcs = ObDatumFuncs::get_basic_func(
+        meta_.get_type(), meta_.get_collation_type());
+    if (OB_ISNULL(funcs)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (funcs->default_hash_ == nullptr) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      ret = funcs->default_hash_(word_, 0, hash_val, nullptr);
+    }
   }
   return ret;
 }
