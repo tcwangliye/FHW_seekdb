@@ -30,6 +30,11 @@ using namespace oceanbase::share;
 using namespace oceanbase::storage;
 using namespace oceanbase::blocksstable;
 using namespace oceanbase::sql;
+
+// Macro block writes kept in flight while direct-loading an index. Encoding the
+// next block then overlaps with the device write of the previous ones.
+static const int64_t DIRECT_LOAD_IO_WINDOW_SIZE = 8;
+
 using namespace oceanbase::transaction;
 
 /**
@@ -126,6 +131,7 @@ int ObDDLMacroBlockWriter::init(
     }
 
     if (OB_SUCC(ret)) {
+      macro_block_writer_.set_io_window_size(DIRECT_LOAD_IO_WINDOW_SIZE);
       if (OB_FAIL(macro_block_writer_.open(data_desc_.get_desc(),
                                            parallel_idx,
                                            macro_seq_param,

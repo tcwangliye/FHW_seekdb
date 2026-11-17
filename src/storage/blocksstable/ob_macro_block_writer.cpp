@@ -472,6 +472,9 @@ int ObMacroBlockWriter::ObSmallSStableMacroBlockFlusher::write_disk(
 ObMacroBlockWriter::ObMacroBlockWriter(const bool is_need_macro_buffer)
   : data_store_desc_(nullptr),
     merge_block_info_(),
+    macro_blocks_(nullptr),
+    macro_handles_(nullptr),
+    io_window_size_(2),
     current_index_(0),
     concurrent_lock_(false),
     custom_macro_flusher_(nullptr),
@@ -519,8 +522,17 @@ void ObMacroBlockWriter::reset()
     index_builder_allocator_.free(builder_);
     builder_ = nullptr;
   }
-  macro_blocks_[0].reset();
-  macro_blocks_[1].reset();
+  if (OB_NOT_NULL(macro_blocks_)) {
+    for (int64_t i = 0; i < io_window_size_; ++i) {
+      macro_blocks_[i].reset();
+    }
+    allocator_.free(macro_blocks_);
+    macro_blocks_ = nullptr;
+  }
+  if (OB_NOT_NULL(macro_handles_)) {
+    allocator_.free(macro_handles_);
+    macro_handles_ = nullptr;
+  }
   allocator_.reset();
   index_builder_allocator_.reset();
   rowkey_allocator_.reset();
@@ -529,8 +541,11 @@ void ObMacroBlockWriter::reset()
 void ObMacroBlockWriter::reset_for_open()
 {
   inner_reset();
-  macro_blocks_[0].reuse();
-  macro_blocks_[1].reuse();
+  if (OB_NOT_NULL(macro_blocks_)) {
+    for (int64_t i = 0; i < io_window_size_; ++i) {
+      macro_blocks_[i].reuse();
+    }
+  }
   allocator_.reuse();
   rowkey_allocator_.reuse();
 }
@@ -550,8 +565,11 @@ void ObMacroBlockWriter::inner_reset()
   last_micro_size_ = INT64_MAX;
   last_micro_expand_pct_ = 100;
   block_write_ctx_.reset();
-  macro_handles_[0].reset();
-  macro_handles_[1].reset();
+  if (OB_NOT_NULL(macro_handles_)) {
+    for (int64_t i = 0; i < io_window_size_; ++i) {
+      macro_handles_[i].reset();
+    }
+  }
   last_key_.reset();
   last_key_with_L_flag_ = false;
   is_macro_or_micro_block_reused_ = false;
@@ -647,13 +665,34 @@ int ObMacroBlockWriter::inner_init(
       }
     }
     int64_t tmp_macro_seq = -1; // to get first macro seq
-    if (FAILEDx(macro_seq_generator_->get_next(tmp_macro_seq))) {
+    const int64_t slot_count = is_need_macro_buffer_ ? io_window_size_ : 1;
+    if (OB_UNLIKELY(io_window_size_ < 1 || io_window_size_ > 16)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (OB_ISNULL(macro_blocks_ = static_cast<ObMacroBlock *>(
+                   allocator_.alloc(sizeof(ObMacroBlock) * slot_count)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_ISNULL(macro_handles_ = static_cast<ObStorageObjectHandle *>(
+                   allocator_.alloc(sizeof(ObStorageObjectHandle) * slot_count)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      for (int64_t i = 0; i < slot_count; ++i) {
+        new (&macro_blocks_[i]) ObMacroBlock();
+        new (&macro_handles_[i]) ObStorageObjectHandle();
+      }
+      io_window_size_ = slot_count;
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(macro_seq_generator_->get_next(tmp_macro_seq))) {
     } else if (OB_FAIL(macro_blocks_[0].init(data_store_desc, tmp_macro_seq, merge_block_info_))) {
-    } else if (is_need_macro_buffer_
-               && OB_FAIL(macro_seq_generator_->preview_next(macro_seq_generator_->get_current(), tmp_macro_seq))) {
-    } else if (is_need_macro_buffer_
-               && OB_FAIL(macro_blocks_[1].init(data_store_desc, tmp_macro_seq, merge_block_info_))) {
-      STORAGE_LOG(WARN, "Fail to init 1th macro block, ", K(ret));
+    } else {
+      for (int64_t i = 1; OB_SUCC(ret) && i < io_window_size_; ++i) {
+        if (OB_FAIL(macro_seq_generator_->preview_next(macro_seq_generator_->get_current(), tmp_macro_seq))) {
+        } else if (OB_FAIL(macro_blocks_[i].init(data_store_desc, tmp_macro_seq, merge_block_info_))) {
+          STORAGE_LOG(WARN, "Fail to init macro block", K(ret), K(i));
+        }
+      }
+    }
+    if (OB_FAIL(ret)) {
     } else if (!data_store_desc_->is_major_merge_type()) {
       // do nothing
     } else if (OB_ISNULL(curr_micro_column_checksum_ = static_cast<int64_t *>(
@@ -1056,8 +1095,9 @@ int ObMacroBlockWriter::close()
       // wait last macro block io finish
       // we also need wait prev macro block to finish due to force_split in build_micro_block
       ObStorageObjectHandle &curr_handle = macro_handles_[current_index_];
-      ObStorageObjectHandle &prev_handle = macro_handles_[(current_index_ + 1) % 2];
-      ObMacroBlock *prev_macro_block = is_need_macro_buffer_ ? &macro_blocks_[(current_index_ + 1) % 2] : nullptr;
+      const int64_t next_index = (current_index_ + 1) % io_window_size_;
+      ObStorageObjectHandle &prev_handle = macro_handles_[next_index];
+      ObMacroBlock *prev_macro_block = is_need_macro_buffer_ ? &macro_blocks_[next_index] : nullptr;
       ObMacroBlock *curr_macro_block = is_need_macro_buffer_ ? &macro_blocks_[current_index_] : nullptr;
       if (OB_UNLIKELY(!is_need_macro_buffer_ && current_index_ != 0)) {
         ret = OB_ERR_UNEXPECTED;
@@ -1067,6 +1107,18 @@ int ObMacroBlockWriter::close()
       } else if (OB_FAIL(wait_io_finish(curr_handle, curr_macro_block))) {
       } else if (OB_NOT_NULL(callback_) && OB_FAIL(callback_->wait())) {
         STORAGE_LOG(WARN, "fail to wait callback flush", K(ret));
+      }
+    }
+    if (OB_SUCC(ret) && io_window_size_ > 2) {
+      // Slots the close path above does not touch may still hold IO; drain them so
+      // every pending callback runs exactly once.
+      for (int64_t i = 0; OB_SUCC(ret) && i < io_window_size_; ++i) {
+        if (!macro_handles_[i].is_empty()) {
+          ObMacroBlock *slot_block = is_need_macro_buffer_ ? &macro_blocks_[i] : nullptr;
+          if (OB_FAIL(wait_io_finish(macro_handles_[i], slot_block))) {
+            STORAGE_LOG(WARN, "fail to drain pending macro block io", K(ret), K(i));
+          }
+        }
       }
     }
 
@@ -1721,8 +1773,9 @@ int ObMacroBlockWriter::flush_macro_block(ObMacroBlock &macro_block, const bool 
   int ret = OB_SUCCESS;
 
   ObStorageObjectHandle &macro_handle = macro_handles_[current_index_];
-  ObStorageObjectHandle &prev_handle = macro_handles_[(current_index_ + 1) % 2];
-  ObMacroBlock *prev_macro_block = is_need_macro_buffer_ ? &macro_blocks_[(current_index_ + 1) % 2] : nullptr;
+  const int64_t next_index = (current_index_ + 1) % io_window_size_;
+  ObStorageObjectHandle &prev_handle = macro_handles_[next_index];
+  ObMacroBlock *prev_macro_block = is_need_macro_buffer_ ? &macro_blocks_[next_index] : nullptr;
   
   if (OB_UNLIKELY(!macro_block.is_dirty())) {
     ret = OB_ERR_UNEXPECTED;
@@ -1872,7 +1925,7 @@ int ObMacroBlockWriter::try_switch_macro_block()
     int32_t row_count = macro_block.get_row_count();
     if (OB_FAIL(flush_macro_block(macro_block, false/*is_close_flush*/))) {
     } else if (is_need_macro_buffer_) {
-      current_index_ = (current_index_ + 1) % 2;
+      current_index_ = (current_index_ + 1) % io_window_size_;
     }
   }
   // do not pre-alloc macro_id here, may occupy extra macro block

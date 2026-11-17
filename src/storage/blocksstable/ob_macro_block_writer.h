@@ -205,6 +205,8 @@ public:
   int check_data_macro_block_need_merge(const ObMacroBlockDesc &macro_desc, bool &need_merge) const;
   int check_meta_macro_block_need_rewrite(bool &need_rewrite) const;
   int close();
+  // Widens the in-flight window; must be called before open().
+  inline void set_io_window_size(const int64_t window_size) { io_window_size_ = window_size; }
   void dump_block_and_writer_buffer();
   inline ObMacroBlocksWriteCtx &get_macro_block_write_ctx() { return block_write_ctx_; }
   inline int64_t get_last_macro_seq() const { return OB_ISNULL(macro_seq_generator_) ? -1 : macro_seq_generator_->get_current(); } /* save our seq num */
@@ -310,7 +312,12 @@ private:
 protected:
   const ObDataStoreDesc *data_store_desc_;
   compaction::ObMergeBlockInfo merge_block_info_;
-  ObMacroBlock macro_blocks_[2];
+  ObMacroBlock *macro_blocks_;
+  ObStorageObjectHandle *macro_handles_;
+  // Number of macro block slots kept in flight. 2 is the minimum ping-pong
+  // window; a wider window lets successive macro block writes overlap with the
+  // encoding of the next block instead of being waited for one by one.
+  int64_t io_window_size_;
   int64_t current_index_;
   volatile bool concurrent_lock_;
   ObIMacroBlockFlusher *custom_macro_flusher_;
@@ -322,7 +329,6 @@ private:
   int64_t last_micro_size_;
   int64_t last_micro_expand_pct_;
   ObMacroBlocksWriteCtx block_write_ctx_;
-  ObStorageObjectHandle macro_handles_[2];
   ObDatumRowkey last_key_;
   bool last_key_with_L_flag_;
   bool is_macro_or_micro_block_reused_;

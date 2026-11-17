@@ -1031,6 +1031,11 @@ int ObFtsIndexBuilderUtil::generate_doc_id_column(
   return ret;
 }
 
+// Lowest degree used when building a posting table, independent of the table's
+// own DOP: a single writer cannot hide the memory latency of a term-ordered
+// build.
+static const int64_t FTS_POSTING_BUILD_MIN_PARALLELISM = 4;
+
 int ObFtsIndexBuilderUtil::decide_parallelism(
     const share::schema::ObIndexType index_type,
     const int64_t original_parallelism,
@@ -1045,9 +1050,16 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
         decided_parallelism = MAX(original_parallelism, 1L);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_DOC_ID_ROWKEY_LOCAL:
+        decided_parallelism = MAX(original_parallelism / 3, 1L);
+        break;
       case share::schema::ObIndexType::INDEX_TYPE_FTS_INDEX_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_FTS_DOC_WORD_LOCAL:
-        decided_parallelism = MAX(original_parallelism / 3, 1L);
+        // The two posting tables are built from a large working set (one row per
+        // term and document), so their build is limited by memory parallelism
+        // rather than by the requested degree. Shrinking the degree collapses
+        // them onto a single writer and leaves that pipeline idle, so keep the
+        // requested degree and only impose a small floor.
+        decided_parallelism = MAX(original_parallelism, FTS_POSTING_BUILD_MIN_PARALLELISM);
         break;
       case share::schema::ObIndexType::INDEX_TYPE_NORMAL_MULTIVALUE_LOCAL:
       case share::schema::ObIndexType::INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL:
