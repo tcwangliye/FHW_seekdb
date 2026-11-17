@@ -15,6 +15,7 @@
  */
 
 #include "sql/engine/expr/ob_expr_tokenize.h"
+#include "storage/fts/ob_fts_literal.h"
 
 #include "lib/alloc/alloc_struct.h"
 #include "lib/allocator/page_arena.h"
@@ -217,15 +218,47 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
   return ret;
 }
 
+namespace
+{
+// TOKENIZE() is normally called with a constant parser name once per row, so the
+// same name is parsed and re-serialised on every call. Keep the last conversion in
+// a thread local buffer and only compare the strings.
+struct ObTokenizeParserNameCache
+{
+  ObTokenizeParserNameCache() : in_len_(-1), out_len_(0) {}
+  char in_[storage::OB_FT_PARSER_NAME_LENGTH];
+  int64_t in_len_;
+  char out_[storage::OB_FT_PARSER_NAME_LENGTH];
+  int64_t out_len_;
+};
+thread_local ObTokenizeParserNameCache g_parser_name_cache;
+} // anonymous namespace
+
 int ObExprTokenize::construct_ft_parser_inner_name(const ObString &input_str, TokenizeParam &param)
 {
   int ret = OB_SUCCESS;
-  storage::ObFTParser parser;
-
-  if (OB_FAIL(parser.init(input_str))) {
-  } else if (OB_FAIL(parser.serialize_to_str(param.parser_name_buf_, sizeof(param.parser_name_buf_)))) {
+  ObTokenizeParserNameCache &cache = g_parser_name_cache;
+  const bool cache_hit = cache.in_len_ == input_str.length()
+      && input_str.length() <= static_cast<int64_t>(sizeof(cache.in_))
+      && (0 == input_str.length() || 0 == MEMCMP(cache.in_, input_str.ptr(), input_str.length()));
+  if (cache_hit) {
+    MEMCPY(param.parser_name_buf_, cache.out_, cache.out_len_);
+    param.parser_name_.assign_ptr(param.parser_name_buf_, static_cast<int32_t>(cache.out_len_));
   } else {
-    param.parser_name_ = ObString::make_string(param.parser_name_buf_);
+    storage::ObFTParser parser;
+    if (OB_FAIL(parser.init(input_str))) {
+    } else if (OB_FAIL(parser.serialize_to_str(param.parser_name_buf_,
+                                               sizeof(param.parser_name_buf_)))) {
+    } else if (FALSE_IT(param.parser_name_ = ObString::make_string(param.parser_name_buf_))) {
+    } else if (OB_UNLIKELY(input_str.length() > static_cast<int64_t>(sizeof(cache.in_))
+                           || param.parser_name_.length() > static_cast<int64_t>(sizeof(cache.out_)))) {
+      cache.in_len_ = -1;  // too long to cache
+    } else {
+      MEMCPY(cache.in_, input_str.ptr(), input_str.length());
+      cache.in_len_ = input_str.length();
+      MEMCPY(cache.out_, param.parser_name_.ptr(), param.parser_name_.length());
+      cache.out_len_ = param.parser_name_.length();
+    }
   }
   return ret;
 }
